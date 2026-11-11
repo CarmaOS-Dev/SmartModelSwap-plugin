@@ -19,9 +19,10 @@ import shlex
 import time
 from pathlib import Path
 
-SKILL_HINT = ("Use sms_swap / sms_restore, `hermes sms stop|start`, or for GPU work "
-              "`bash ~/.hermes/skills/smart-model-routing/templates/gpu_job.sh <small-model|none> -- <job>` "
-              "(frees VRAM through SMP and always restores). See skill smart-model-routing.")
+def skill_hint(tools) -> str:
+    return ("Use sms_swap / sms_restore, `hermes sms stop|start`, or for GPU work "
+            f"`bash {tools.gpu_job_script()} <small-model|none> -- <job>` "
+            f"(frees VRAM through SMP and always restores). Rules: {tools.SKILL_REF}.")
 
 _SEG_SPLIT = re.compile(r"\|\||&&|[;|&\n]")
 _WRAPPERS = {"sudo", "nohup", "exec", "setsid", "env", "time", "command", "stdbuf", "nice", "ionice",
@@ -206,7 +207,7 @@ def make_hook(tools):
                 return {"action": "block", "message":
                         f"[smart-model-swap guard] Blocked: {why}. The local LLM is managed by "
                         f"SmartModelProvider; stopping/starting it by hand breaks swaps and can leave "
-                        f"the agent without a model. {SKILL_HINT}"}
+                        f"the agent without a model. {skill_hint(tools)}"}
             if found["comfy"] and not (found["gpu_job"] or found["allow_gpu"]):
                 primary = tools.get_cfg().get("primary_model")
                 current = tools.match_model(tools.llm_health(timeout=1.5))
@@ -217,7 +218,7 @@ def make_hook(tools):
                             f"'{current}' holds the GPU. Run the job through gpu_job.sh (frees VRAM via SMP "
                             f"and restores the primary afterwards). If `sms_plan` (single_gpu=true) says the "
                             f"task already fits, re-run the same command prefixed with SMS_ALLOW_GPU=1. "
-                            f"{SKILL_HINT}"}
+                            f"{skill_hint(tools)}"}
             return None
         except Exception:  # noqa: BLE001 - a guard must never break a tool call
             return None

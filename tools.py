@@ -1574,6 +1574,17 @@ def wait_health(entry: dict, started_by: str, proc=None) -> dict:
 
 # ------------------------------------------------------------------ helpers
 
+SKILL_NAME = "smart-model-routing"
+SKILL_REF = 'skill_view("smart-model-swap:smart-model-routing")'
+
+
+def gpu_job_script() -> str:
+    """Path of the bundled gpu_job.sh, with ~ for the home directory."""
+    p = str(PLUGIN_DIR / "skills" / SKILL_NAME / "templates" / "gpu_job.sh")
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p.startswith(home + os.sep) else p
+
+
 def jdump(obj) -> str:
     return json.dumps(obj, indent=2, ensure_ascii=False)
 

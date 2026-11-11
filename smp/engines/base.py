@@ -42,7 +42,7 @@ def proc_argv(pid: int) -> list[str]:
 class Engine:
     id = ""
     label = ""
-    status = "stable"        # "stable" | "wip" (shown as "En construcción")
+    status = "stable"        # "stable" | "wip" (shown as "under construction")
     managed = True           # SMP can start/stop/swap models on it
     default_port = 8080
     exe_names: tuple[str, ...] = ()

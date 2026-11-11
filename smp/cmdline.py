@@ -14,6 +14,8 @@ import re
 import shlex
 from typing import Callable, Optional
 
+from .i18n import t as _t
+
 # Flags the engine injects itself: never stored in a model's args.
 MODEL_FLAGS = ("-m", "--model")
 ENDPOINT_FLAGS = ("--host", "-host", "--port", "-port")
@@ -137,7 +139,7 @@ def parse_env(text_or_map) -> tuple[dict, list[str]]:
             items.append((k.strip(), v.strip().strip('"').strip("'")))
     for k, v in items:
         if not _ENV_KEY.match(k):
-            errors.append(f"clave de entorno inválida: '{k}'")
+            errors.append(_t(f"clave de entorno inválida: '{k}'", f"invalid environment key: '{k}'"))
         else:
             env[k] = v
     return env, errors

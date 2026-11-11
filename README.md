@@ -1,7 +1,19 @@
 # Smart-Model-Swap 🐉
 
-Hot-swap local LLM models by task, with VRAM auto-detection and ComfyUI cohabitation.
-For dual-GPU WSL rigs that run `llama.cpp` (the agent brain) and ComfyUI side by side.
+Run a **big** and a **small** local LLM on one rig and let the agent switch between them by task:
+
+- the small one for quick or voice chat, and to free VRAM for GPU jobs such as ComfyUI;
+- the big one for deep work.
+
+Swaps run in the background without cutting the agent's reply. The plugin checks per-GPU VRAM before loading a model and brings the big model back on its own when idle.
+
+![Dashboard tab](docs/screenshots/dashboard.png)
+
+**Requirements**
+- Linux or WSL2 with an NVIDIA GPU and `nvidia-smi`.
+- A built [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`.
+- GGUF models on disk.
+- Optional: a systemd user session, so the engine runs in its own transient scope and survives gateway restarts.
 
 **SmartModelProvider (SMP)** is the engine manager inside the plugin. It launches
 the inference engine you picked and manages the models on it — no systemd unit.
@@ -53,9 +65,10 @@ CLI: `hermes sms status|plan|swap <m> [--dry-run] [--wait] [--force]|restore [--
     is not released, it reloads the previous model (or the smallest one that fits) instead of the target.
   - `hermes sms check [model] [--wait N]` runs the same gate from scripts. `sms_status` lists
     `gpu_holders`.
-- The agent's big-vs-small routing rules live in the Hermes skill `smart-model-routing`
-  (`~/.hermes/skills/smart-model-routing/`), including `templates/gpu_job.sh`, which frees VRAM, runs a job
-  and always restores.
+- **Bundled skill.** The agent's big-vs-small routing rules ship with the plugin as
+  `skill_view("smart-model-swap:smart-model-routing")` (`skills/smart-model-routing/`). It includes
+  `templates/gpu_job.sh`, which frees VRAM, runs a job and always restores. Plugin skills are not listed in the
+  system prompt; the tool descriptions and hints point the agent to it.
 
 ## Engines
 
@@ -133,8 +146,8 @@ presence penalty and repeat penalty.
 The active preset overrides the base args on the command line the next time the
 model is loaded.
 
-Bundled default: Signal 3.8 27B Heretic-ara Q6_K (primary brain, 98 k ctx, MTP) and
-Qwen3.5 9B Q5_K_M (image tasks, 65 k ctx).
+`models.example.json` ships two placeholder entries, `signal` (the big primary, 98 k ctx) and `qwen` (the small
+model, same context). Rename them and point them at your own GGUFs.
 
 ## SmartModelProvider (optional model-provider half)
 
@@ -232,14 +245,16 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
   shows English. Their strings live in an `I18N = {es, en}` table at the top of `dashboard/dist/index.js` and
   `desktop/plugin.js`.
 - Every API call carries `?lang=`, and the backend localizes its messages with `smp.i18n.t("es", "en")`
-  (errors, warnings, engine notes). Without `lang`, for example from agent tools or the CLI, messages default to Spanish.
+  (errors, warnings, engine notes). Without `lang` (agent tools, hooks, CLI), messages follow Hermes'
+  `display.language`: set `display.language: es` for Spanish; the default is English.
 - The parameter catalogue (names and descriptions from the llama.cpp parameter DB) is English in both languages.
 
 ## Settings (plugin.yaml → Hermes Desktop settings)
 
 `primary_model`, `autostart_primary`, `gpu_wait_s`, `isolate_scope`, `models_file`,
-`nvidia_smi`, `grace_s`, `drain_timeout_s`, `vram_settle_mib`, `vram_settle_timeout_s`,
-`comfy_url`, `inject_status`. The engine binary, host and port are now in the
+`nvidia_smi`, `grace_s`, `drain_timeout_s`, `drain_max_s`, `release_wait_s`, `idle_restore_min`,
+`vram_settle_mib`, `vram_settle_timeout_s`, `comfy_url`, `inject_status`, `guard_tools`,
+`block_when_unloaded`. The engine binary, host and port are now in the
 **Engines** card (`models.json` → `engines`). `llama_bin`, `base_url` and
 `systemd_unit` are only read once, to migrate a 0.2 install.
 
@@ -249,15 +264,50 @@ Disable the old unit so it does not race SMP for the port at boot:
 `systemctl --user disable --now llama-server`. The unit file and its script can stay as
 a backup; SMP never reads or starts them.
 
-## Install (local)
+## Install
 
-If you already have the plugin directory in `~/.hermes/plugins/`, just enable it:
+From the plugin catalog:
 
 ```bash
+hermes plugins install smart-model-swap
 hermes plugins enable smart-model-swap
 ```
 
+Or clone this repository into `~/.hermes/plugins/smart-model-swap` and enable it. On first load the plugin
+copies `models.example.json` to `models.json`; then set the engine binary and your models in the dashboard tab
+or the Desktop pane.
+
 No `pip install` required — pure standard library. For a full, step-by-step guide see [INSTALL.md](./INSTALL.md).
+
+## Security & disclosures
+
+What the plugin does on your machine, so you can decide before installing:
+
+- **Long-running processes.**
+  - It starts `llama-server` itself: in a transient `systemd-run --user --scope` when available, otherwise in its own session.
+  - A detached runner per swap, and an idle watcher after a swap to a smaller model.
+  - With `autostart_primary` (default on), the primary model loads, and takes GPU memory, when the gateway starts.
+- **Signals.** It sends SIGINT, then SIGKILL after a timeout, only to the engine process it manages, or to an engine
+  process of the same kind holding the engine port. It never touches unrelated processes; a port held by anything
+  else is reported, not killed.
+- **Shell commands.** `nvidia-smi`, `ss`, `systemctl --user show`, `systemd-run`, and `llama-server --help` /
+  `--version` (to build the parameter catalog and validate launch lines).
+- **Reads outside its folder.**
+  - `/proc/<pid>` of other processes, to identify the engine and GPU users.
+  - With the guard enabled, the shell scripts a `terminal` command is about to run, to block manual engine management.
+  - Your `config.yaml`, through Hermes' public config API.
+- **Writes outside its folder.**
+  - Its own settings in `config.yaml`, through the public `hermes_cli.config.save_config`.
+  - On request only ("install" in the UI or `hermes sms provider install`), a model-provider plugin in
+    `~/.hermes/plugins/model-providers/smart-model-provider/`, generated from templates in this repository.
+  - State and logs in `~/.hermes/cache/smart-model-swap/`.
+- **Agent behaviour.**
+  - Adds one-line hints to turns.
+  - Can veto `terminal` / `execute_code` calls that would manage the engine by hand.
+  - Can end a turn at once, with an explanation, while the LLM is unloaded on purpose.
+- **Network.** HTTP only to the endpoints you configure: the engine (default `127.0.0.1:8080`), ComfyUI (default
+  `127.0.0.1:8188`), and the health endpoints of the detection-only engines. No third-party services.
+- **No** telemetry, stored credentials, self-updater or approval bypass.
 
 ## License
 

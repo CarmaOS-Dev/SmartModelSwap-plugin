@@ -32,7 +32,7 @@ PLAN_SCHEMA = {
         "Call it BEFORE starting image/video generation, TTS/voice or any other task "
         "that needs GPU memory, passing the VRAM that task needs, to decide whether a "
         "swap to a smaller model is required. Big-vs-small rules (GPU jobs, deep "
-        "analysis, quick voice chat): skill smart-model-routing."
+        "analysis, quick voice chat): load skill_view(\"smart-model-swap:smart-model-routing\")."
     ),
     "parameters": {
         "type": "object",
@@ -71,7 +71,7 @@ SWAP_SCHEMA = {
         "short final reply. The next turn runs on the new model (check sms_status). "
         "Every swap leaves ALL sessions without an LLM for 2-4 min: never swap for a "
         "single message. Rules and the blocking CLI (`hermes sms swap X --wait`): "
-        "skill smart-model-routing. Never start/stop llama-server by hand or via systemctl. "
+        "skill_view(\"smart-model-swap:smart-model-routing\"). Never start/stop llama-server by hand or via systemctl. "
         "After a swap to a smaller model, the primary is restored automatically once the "
         "engine has been idle for a while (setting idle_restore_min)."
     ),

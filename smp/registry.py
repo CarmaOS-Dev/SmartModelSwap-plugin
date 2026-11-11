@@ -54,7 +54,7 @@ def migrate(data: dict, legacy: dict | None = None) -> tuple[dict, list[str]]:
         llama.setdefault("common_args", common)
         llama.setdefault("env", dict(legacy.get("env") or {}))
         engines["llamacpp"] = llama
-        notes.append("common_args/host/port movidos a engines.llamacpp")
+        notes.append("common_args/host/port moved to engines.llamacpp")
 
         ui = legacy.get("ui") or {}
         for key, srv in (ui.get("servers") or {}).items():
@@ -73,11 +73,11 @@ def migrate(data: dict, legacy: dict | None = None) -> tuple[dict, list[str]]:
             if not isinstance(m, dict):
                 continue
             if m.pop("start_mode", None) is not None:
-                notes.append(f"{m.get('name')}: start_mode eliminado (SMP lanza el motor)")
+                notes.append(f"{m.get('name')}: start_mode removed (SMP launches the engine)")
             m.setdefault("engine", "llamacpp")
             args, dropped = strip_managed([str(a) for a in (m.get("args") or [])])
             if dropped:
-                notes.append(f"{m.get('name')}: {', '.join(dropped)} quitados de args (los pone el motor)")
+                notes.append(f"{m.get('name')}: {', '.join(dropped)} removed from args (set by the engine)")
             m["args"] = args
         out["version"] = VERSION
 
@@ -87,7 +87,7 @@ def migrate(data: dict, legacy: dict | None = None) -> tuple[dict, list[str]]:
         if not isinstance(cur, dict):
             engines[eid] = eng.defaults()
             if data.get("version") == VERSION:
-                notes.append(f"engines.{eid} añadido")
+                notes.append(f"engines.{eid} added")
         else:
             for k, v in eng.defaults().items():
                 if k not in cur or (k == "bin" and not cur.get("bin") and eid == "llamacpp"):

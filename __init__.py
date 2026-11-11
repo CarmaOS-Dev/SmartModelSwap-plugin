@@ -93,27 +93,27 @@ def register(ctx) -> None:
     ctx.register_tool(
         "sms_status", "smart_model_swap", schemas.STATUS_SCHEMA, _fresh(tools.h_status),
         check_fn=check, emoji="📊",
-        description="VRAM, modelo actual y estado de Smart-Model-Swap",
+        description="VRAM, current model and Smart-Model-Swap state",
     )
     ctx.register_tool(
         "sms_plan", "smart_model_swap", schemas.PLAN_SCHEMA, _fresh(tools.h_plan),
         check_fn=check, emoji="🧠",
-        description="Recomienda modelo según presupuesto de VRAM",
+        description="Recommend a model for a VRAM budget",
     )
     ctx.register_tool(
         "sms_swap", "smart_model_swap", schemas.SWAP_SCHEMA, _fresh(tools.h_swap),
         check_fn=check, emoji="🔄",
-        description="Swap en caliente al modelo objetivo (fondo, con grace)",
+        description="Hot-swap to the target model (background, with grace)",
     )
     ctx.register_tool(
         "sms_restore", "smart_model_swap", schemas.RESTORE_SCHEMA, _fresh(tools.h_restore),
         check_fn=check, emoji="🏠",
-        description="Restaura el modelo primario (el cerebro del agente)",
+        description="Restore the primary model (the agent's main brain)",
     )
 
     ctx.register_command(
         "swap", _fresh(tools.cmd_swap),
-        description="Smart-Model-Swap: /swap <modelo> [dry] · /swap restore [dry] · /swap plan [gb] · /swap status",
+        description="Smart-Model-Swap: /swap <model> [dry] · /swap restore [dry] · /swap plan [gb] · /swap status",
         args_hint="[modelo|restore|plan|status] [dry]",
     )
 
@@ -121,9 +121,20 @@ def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", guard.make_hook(tools))
     ctx.register_hook("pre_transcription", hints.note_voice)
 
+    # Bundled skills (read-only, namespaced: smart-model-swap:<name>).
+    try:
+        from pathlib import Path
+        skills_dir = Path(__file__).parent / "skills"
+        for child in sorted(skills_dir.iterdir()) if skills_dir.is_dir() else []:
+            skill_md = child / "SKILL.md"
+            if child.is_dir() and skill_md.exists():
+                ctx.register_skill(child.name, skill_md)
+    except Exception:  # noqa: BLE001 - never block plugin load over a skill
+        log.debug("smart-model-swap skills not registered", exc_info=True)
+
     ctx.register_cli_command(
         "sms",
-        help="Smart-Model-Swap: status/plan/swap/restore de modelos locales",
+        help="Smart-Model-Swap: status/plan/swap/restore local models",
         setup_fn=tools.setup_sms,
         handler_fn=tools.cli_sms,
     )
