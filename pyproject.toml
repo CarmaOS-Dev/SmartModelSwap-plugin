@@ -1,0 +1,12 @@
+[project]
+name = "smart-model-swap"
+version = "0.3.0"
+description = "Hot-swap local LLM models by task with VRAM auto-detection and ComfyUI cohabitation. SmartModelProvider launches the engine itself (no systemd) with a full launch-parameter editor; grace-countdown background swaps and VRAM settle waits. Built for dual-GPU WSL rigs running llama.cpp + ComfyUI side by side."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+]

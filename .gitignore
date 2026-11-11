@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- smart-model-swap: local, machine-specific state (never commit) ---
+models.json
+models.json.bak-v1
+models.json.*.tmp
+.claude/
+# dashboard/dist is hand-written source (no build step), not a build artifact
+!dashboard/dist/

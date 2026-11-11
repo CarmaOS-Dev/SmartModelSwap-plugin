@@ -1,0 +1,11 @@
+{
+  "name": "smart-model-swap",
+  "label": "Model Swap",
+  "description": "Hot-swap local LLM models by VRAM budget: status, swap/restore, servers and model registry.",
+  "icon": "Sparkles",
+  "version": "0.2.0",
+  "tab": { "path": "/smart-model-swap", "position": "end" },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

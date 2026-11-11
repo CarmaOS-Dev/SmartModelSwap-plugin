@@ -1,0 +1,106 @@
+name: smart-model-swap
+version: "0.3.0"
+manifest_version: 2
+license: MIT
+tags: [models, local-llm, llama.cpp, inference-engines, vram, comfyui, gpu]
+description: "Hot-swap local LLM models by task with VRAM auto-detection and ComfyUI cohabitation. SmartModelProvider launches the inference engine itself (llama.cpp; Ollama, vLLM and LM Studio under construction) - no systemd unit - and ships a full launch-parameter editor. Swaps run in the background with a grace countdown and VRAM settle. Built for dual-GPU WSL rigs running llama.cpp + ComfyUI side by side."
+author: "Oscar Carreto (DraksoN)"
+kind: standalone
+platforms:
+  - linux
+provides_tools:
+  - sms_status
+  - sms_plan
+  - sms_swap
+  - sms_restore
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - pre_transcription
+entry: __init__.py
+config_schema:
+  primary_model:
+    type: str
+    label: Primary model
+    description: Model name (from models.json) restored by sms_restore and autostarted with the gateway.
+    default: signal
+  autostart_primary:
+    type: bool
+    label: Autostart the primary model
+    description: When the gateway starts and nothing is serving on the engine's port, SmartModelProvider loads the primary model in the background (replaces the old llama-server systemd unit).
+    default: true
+  gpu_wait_s:
+    type: int
+    label: Autostart GPU / disk wait (s)
+    description: At autostart, max seconds to wait for the NVIDIA driver and the model file (a WSL mount) to become ready.
+    default: 180
+  release_wait_s:
+    type: int
+    label: Release wait before loading (s)
+    description: Before loading a model, wait up to this many seconds for other heavy GPU processes (ComfyUI, etc.) to release the VRAM it needs on each GPU. If they don't, the model is NOT loaded and the previous or smallest model that fits is loaded instead.
+    default: 120
+  isolate_scope:
+    type: bool
+    label: Isolate models from gateway restarts
+    description: Run the runner and the models in their own transient cgroup (systemd-run --user --scope) so restarting the gateway does not kill them. Not a service - start and stop never go through systemd.
+    default: true
+  models_file:
+    type: str
+    label: Models file
+    description: Path to a custom models.json (engines + models; empty = bundled).
+    default: ""
+  nvidia_smi:
+    type: str
+    label: nvidia-smi
+    description: Path to nvidia-smi (empty to auto-detect on PATH).
+    default: "/usr/lib/wsl/lib/nvidia-smi"
+  grace_s:
+    type: int
+    label: Grace seconds
+    description: Seconds between sms_swap and the actual model kill (lets the agent finish its turn).
+    default: 10
+  drain_timeout_s:
+    type: int
+    label: Drain stall timeout (s)
+    description: After the grace countdown, in-flight requests are allowed to finish. The model is cut early only if generation makes no progress for this many seconds (0 = do not wait).
+    default: 120
+  drain_max_s:
+    type: int
+    label: Drain maximum (s)
+    description: Hard cap on the drain even while a request keeps generating (a long reasoning reply), so a swap never waits forever.
+    default: 600
+  vram_settle_mib:
+    type: int
+    label: VRAM settle threshold (MiB)
+    description: Wait until every GPU's used VRAM is below this after a kill.
+    default: 300
+  vram_settle_timeout_s:
+    type: int
+    label: VRAM settle timeout (s)
+    description: Max seconds to wait for VRAM to settle.
+    default: 90
+  comfy_url:
+    type: str
+    label: ComfyUI URL
+    description: ComfyUI base URL for cohabitation checks.
+    default: "http://127.0.0.1:8188"
+  idle_restore_min:
+    type: int
+    label: Restore the primary after N idle minutes
+    description: After a swap to a smaller model, bring the primary back once the engine has been idle this long (no tokens processed, no gpu_job.sh running, no other GPU users) and its VRAM is free. 0 disables it.
+    default: 15
+  block_when_unloaded:
+    type: bool
+    label: Answer at once while the LLM is unloaded on purpose
+    description: When a message arrives while a gpu_job.sh holds the GPU or a swap/load is in flight, end the turn immediately with an explanation (the user is asked to resend) instead of letting Hermes retry for minutes and fail with "HTTP 503 Loading model".
+    default: true
+  guard_tools:
+    type: bool
+    label: Block manual LLM management by the agent
+    description: Vetoes terminal/execute_code commands that stop, kill or launch llama-server behind SmartModelProvider (systemctl llama-server, pkill, ~/llama-server.sh), and ComfyUI launches while the primary model holds the GPU unless they go through gpu_job.sh or carry SMS_ALLOW_GPU=1. Blocks are logged in cache/smart-model-swap/guard.log.
+    default: true
+  inject_status:
+    type: bool
+    label: Tell the model when a secondary model is active
+    description: Adds a one-line note to the turn while the primary model is unloaded or a swap is in flight.
+    default: true

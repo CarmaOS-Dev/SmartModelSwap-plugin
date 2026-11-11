@@ -1,0 +1,96 @@
+"""SmartModelProvider - the model-provider half of the smart-model-swap plugin.
+
+Installed (on the user's request) by smart-model-swap into
+$HERMES_HOME/plugins/model-providers/smart-model-provider/. Do not edit: the
+plugin rewrites this directory. It exposes the models of the plugin's registry
+(catalog.json, written by the plugin) as a Hermes provider served by the local
+inference engine SmartModelProvider launches (llama.cpp today).
+
+It registers nothing when the smart-model-swap plugin is gone, so it cannot be
+used on its own.
+"""
+from __future__ import annotations
+
+import json
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+from providers import register_provider
+from providers.base import ProviderProfile
+
+_HERE = Path(__file__).resolve().parent
+
+
+def _catalog() -> dict:
+    try:
+        data = json.loads((_HERE / "catalog.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 - missing/corrupt catalog: expose nothing
+        return {}
+
+
+def _server_root(url: str) -> str:
+    url = (url or "").strip().rstrip("/")
+    return url[:-3].rstrip("/") if url.endswith("/v1") else url
+
+
+class SmartModelProfile(ProviderProfile):
+    """Local engine server launched by SmartModelProvider: no API key."""
+
+    def resolve_api_key_secret(self) -> tuple[str, str] | None:
+        return "sms-local", "smart-model-swap (local server, no key)"
+
+    def runtime_base_url(self, *, api_key: str, default: str, env_url: str) -> str | None:
+        if env_url:
+            return env_url
+        root = _server_root(str(_catalog().get("base_url") or ""))
+        return root + "/v1" if root else None
+
+    def live_context_length(self, model: str, *, api_key: str = "", base_url: str = "") -> int | None:
+        """Context of the model that is loaded right now (llama.cpp /props)."""
+        root = _server_root(base_url or str(_catalog().get("base_url") or ""))
+        if not root:
+            return None
+        try:
+            with urllib.request.urlopen(root + "/props", timeout=2) as r:
+                props: Any = json.load(r)
+            n = int(props["default_generation_settings"]["n_ctx"])
+            return n if n > 0 else None
+        except Exception:  # noqa: BLE001 - server down or not llama.cpp
+            return None
+
+
+def _register() -> None:
+    cat = _catalog()
+    owner = str(cat.get("owner_dir") or "")
+    if not owner or not (Path(owner) / "plugin.yaml").is_file():
+        return  # smart-model-swap was removed: this half does nothing alone
+    models = [m for m in (cat.get("models") or []) if isinstance(m, dict) and m.get("name")]
+    if not models:
+        return
+    caps: dict[str, dict[str, Any]] = {}
+    for m in models:
+        cap: dict[str, Any] = {"supports_tools": True, "supports_vision": bool(m.get("vision"))}
+        if m.get("ctx"):
+            cap["context_window"] = int(m["ctx"])
+        caps[str(m["name"])] = cap
+    primary = str(cat.get("primary") or models[0]["name"])
+    register_provider(SmartModelProfile(
+        name="smart-model-provider",
+        aliases=("smartmodelprovider", "sms"),
+        display_name="SmartModelProvider",
+        description="Local models launched by SmartModelProvider (smart-model-swap)",
+        # No base_url on purpose: a loopback URL here would make Hermes attribute
+        # every 127.0.0.1 endpoint (Ollama, LM Studio, vLLM) to this provider.
+        env_vars=("SMS_API_KEY", "SMS_BASE_URL"),
+        auth_type="api_key",
+        supports_model_listing=False,
+        supports_health_check=False,
+        fallback_models=tuple(str(m["name"]) for m in models),
+        model_capabilities=caps,
+        default_aux_model=primary,
+    ))
+
+
+_register()
