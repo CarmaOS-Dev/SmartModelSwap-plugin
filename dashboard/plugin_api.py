@@ -110,16 +110,46 @@ def resolve_cfg() -> dict:
     return tools.get_cfg()
 
 
-def set_setting(key: str, value: Any) -> dict:
-    """Write one plugin setting through Hermes' schema-validated writer.
+_SETTING_TYPES = {"bool": (bool,), "int": (int,), "float": (int, float), "string": (str,), "str": (str,)}
 
-    No hand-rolled config.yaml fallback: rewriting the user's whole config
-    with a YAML dump loses comments and races other writers.
-    """
+
+def _schema_type(key: str) -> Optional[str]:
+    """The `type` this plugin's plugin.yaml config_schema declares for `key`."""
     try:
-        from hermes_cli.plugins_settings import save_plugin_settings
-        written = save_plugin_settings(PLUGIN_ID, PLUGIN_ROOT, {key: value})
-        return {"ok": True, "via": "schema", "written": written}
+        import yaml  # bundled with Hermes
+        schema = (yaml.safe_load((PLUGIN_ROOT / "plugin.yaml").read_text()) or {}).get("config_schema") or {}
+        spec = schema.get(key)
+        return str((spec or {}).get("type") or "string") if spec is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def set_setting(key: str, value: Any) -> dict:
+    """Write one plugin setting (`plugins.entries.<id>.settings.<key>`).
+
+    Public surface only (catalog rule 9): `hermes_cli.config.save_config` with
+    `merge_existing=True` merges this one key into the on-disk config under the
+    config lock, like `hermes config set`. `ctx.set_config` would be the plugin
+    API, but this module is imported by the dashboard process, which may never
+    run `register(ctx)`, so there is no context to use here.
+    """
+    kind = _schema_type(key)
+    if key not in tools.DEFAULTS or kind is None:
+        return {"ok": False, "error": t(f"ajuste desconocido: '{key}'", f"unknown setting: '{key}'")}
+    expected = _SETTING_TYPES.get(kind, (str,))
+    if not isinstance(value, expected) or (isinstance(value, bool) and bool not in expected):
+        return {"ok": False, "error": t(f"'{key}' debe ser {kind}", f"'{key}' must be {kind}")}
+    try:
+        from hermes_cli.config import is_managed, load_config_readonly, save_config
+        if is_managed():
+            return {"ok": False, "error": t("instalación gestionada: los ajustes no se pueden cambiar",
+                                            "managed install: settings cannot be changed")}
+        save_config({"plugins": {"entries": {PLUGIN_ID: {"settings": {key: value}}}}}, merge_existing=True)
+        entry = (((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}).get(PLUGIN_ID) or {}
+        if (entry.get("settings") or {}).get(key) != value:
+            return {"ok": False, "error": t(f"no se pudo guardar '{key}' (¿clave administrada?)",
+                                            f"could not save '{key}' (administrator-managed key?)")}
+        return {"ok": True, "via": "config", "written": [key]}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
