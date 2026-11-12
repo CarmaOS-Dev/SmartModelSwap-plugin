@@ -190,8 +190,12 @@ const I18N = {
     swapFailed: 'swap falló',
     gpuJobUnloaded: 'LLM descargado por un trabajo de GPU',
     gpuJobShort: 'trabajo de GPU',
-    gpuJobUnloadedNote: (job, min) => `Trabajo en curso${job ? ` (${job})` : ''}, ${min} min. El primario vuelve solo al terminar; no hagas swap mientras tanto.`,
-    gpuJobRunningNote: (job, min) => `Trabajo de GPU en curso${job ? ` (${job})` : ''}, ${min} min. El primario vuelve solo al terminar.`,
+    gpuJobUnloadedNote: (job, min) => `Trabajo en curso${job ? ` (${job})` : ''}, ${min} min. Al terminar vuelve un modelo solo; no hagas swap mientras tanto.`,
+    gpuJobRunningNote: (job, min) => `Trabajo de GPU en curso${job ? ` (${job})` : ''}, ${min} min. Al terminar sigue respondiendo el modelo cargado.`,
+    gpuModeTitle: 'Trabajos de GPU · modo',
+    gpuModeTip: 'Qué hacer con el modelo cuando llega un trabajo de alta carga en VRAM (ComfyUI, vídeo, 3D…). Lo aplica gpu_job.sh auto.',
+    gpuModeSaved: label => `Modo para trabajos de GPU: ${label}`,
+    gpuModeNow: 'Ahora:',
     // registration
     restUnavailable: 'ctx.rest no disponible en esta version del SDK'
   },
@@ -354,8 +358,12 @@ const I18N = {
     swapFailed: 'swap failed',
     gpuJobUnloaded: 'LLM unloaded for a GPU job',
     gpuJobShort: 'GPU job',
-    gpuJobUnloadedNote: (job, min) => `Job running${job ? ` (${job})` : ''}, ${min} min. The primary comes back by itself when it ends; do not swap meanwhile.`,
-    gpuJobRunningNote: (job, min) => `GPU job running${job ? ` (${job})` : ''}, ${min} min. The primary comes back by itself when it ends.`,
+    gpuJobUnloadedNote: (job, min) => `Job running${job ? ` (${job})` : ''}, ${min} min. A model comes back by itself when it ends; do not swap meanwhile.`,
+    gpuJobRunningNote: (job, min) => `GPU job running${job ? ` (${job})` : ''}, ${min} min. The loaded model keeps answering when it ends.`,
+    gpuModeTitle: 'GPU jobs · mode',
+    gpuModeTip: 'What to do with the model when a VRAM-heavy job arrives (ComfyUI, video, 3D…). Applied by gpu_job.sh auto.',
+    gpuModeSaved: label => `GPU job mode: ${label}`,
+    gpuModeNow: 'Now:',
     // registration
     restUnavailable: 'ctx.rest is not available in this SDK version'
   }
@@ -1548,6 +1556,17 @@ function SwapPane({ rest }) {
         )
     })
   }
+  // ---- GPU job mode: what gpu_job.sh does with the LLM during a VRAM-heavy job
+  const gpuModes = (data && data.gpu_job_modes) || {}
+  const gpuModeList = gpuModes.modes || []
+  const gpuModeSel = gpuModeList.find(m => m.id === gpuModes.mode) || null
+  function pickGpuMode(id) {
+    const m = gpuModeList.find(x => x.id === id)
+    call('/gpu_job/mode', { mode: id }, 'gpumode').then(r => {
+      if (r && r.ok) flash('ok', t('gpuModeSaved', m ? m.label : id))
+    })
+  }
+
   function slotSelect(slot, value) {
     return jsxs('select', {
       value,
@@ -1696,6 +1715,61 @@ function SwapPane({ rest }) {
           ? jsx('div', {
               className: 'text-[11px] text-(--ui-text-tertiary)',
               children: t('activeEngineWip')
+            })
+          : null,
+
+        // ---- GPU job mode selector
+        gpuModeList.length
+          ? jsxs('div', {
+              className: 'flex flex-col gap-1',
+              children: [
+                jsx(Tip, {
+                  label: t('gpuModeTip'),
+                  children: jsx('span', {
+                    className: 'w-fit text-[10px] font-medium uppercase tracking-wide text-(--ui-text-tertiary)',
+                    children: t('gpuModeTitle')
+                  })
+                }),
+                jsx('div', {
+                  role: 'radiogroup',
+                  'aria-label': t('gpuModeTitle'),
+                  className: 'flex flex-wrap gap-1',
+                  children: gpuModeList.map(m =>
+                    jsx(
+                      'button',
+                      {
+                        type: 'button',
+                        role: 'radio',
+                        'aria-checked': m.id === gpuModes.mode ? 'true' : 'false',
+                        title: m.description,
+                        disabled: !!busy,
+                        onClick: () => (m.id === gpuModes.mode ? null : pickGpuMode(m.id)),
+                        className: cn(
+                          'rounded-[3px] border px-2 py-0.5 text-xs transition-colors',
+                          m.id === gpuModes.mode
+                            ? 'border-(--ui-accent) text-(--ui-accent)'
+                            : 'border-(--ui-stroke-secondary) text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground',
+                          busy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+                        ),
+                        children: m.label
+                      },
+                      m.id
+                    )
+                  )
+                }),
+                gpuModeSel
+                  ? jsx('div', { className: 'text-[11px] text-(--ui-text-tertiary)', children: gpuModeSel.description })
+                  : null,
+                gpuModes.summary
+                  ? jsx('div', {
+                      className: cn(
+                        'text-[11px]',
+                        gpuModes.layout && gpuModes.layout.degraded ? 'text-(--ui-yellow,#d29922)' : 'text-(--ui-text-tertiary)'
+                      ),
+                      children: `${t('gpuModeNow')} ${gpuModes.summary}`
+                    })
+                  : null
+              ]
             })
           : null,
 

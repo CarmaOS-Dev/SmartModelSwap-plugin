@@ -93,6 +93,10 @@ class Engine:
         for src in (self.normalize(ecfg).get("env") or {}, (entry or {}).get("env") or {}):
             if isinstance(src, dict):
                 env.update({str(k): str(v) for k, v in src.items()})
+        pin = (entry or {}).get("pin_gpu")
+        if pin is not None:  # one physical GPU, numbered like nvidia-smi
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            env["CUDA_VISIBLE_DEVICES"] = str(int(pin))
         return env
 
     def version(self, ecfg: dict, entry: Optional[dict] = None) -> dict:
@@ -129,6 +133,15 @@ class Engine:
                   gpus: list[int]) -> Optional[dict]:
         """{physical GPU index: fraction of the model's VRAM}, or None if unknown."""
         return None
+
+    def finalize_args(self, ecfg: dict, entry: dict, args: list[str]) -> list[str]:
+        """Last pass over the launch args (pin to one GPU, engine-specific fixes)."""
+        return self.pin_args(args) if entry.get("pin_gpu") is not None else list(args)
+
+    def pin_args(self, args: list[str]) -> list[str]:
+        """Launch args for a model pinned to ONE GPU (entry["pin_gpu"]): drop the
+        flags that spread it over several. The device itself is picked in env()."""
+        return list(args)
 
     # ------------------------------------------------------------ probes
     def probe(self, url: str, timeout: float = 1.5) -> dict:

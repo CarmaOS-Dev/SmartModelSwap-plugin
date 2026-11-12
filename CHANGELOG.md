@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Fast reply after a GPU job.** `gpu_job.sh` no longer reloads the primary when the job ends: the small model (already loaded, or the smallest that fits after `none`) delivers the result. The primary returns on demand (`sms_restore`) or through the idle restore. New setting `after_gpu_job` (`small` default, `primary` = old behaviour) and CLI `hermes sms after-job`.
+- **`gpu_job.sh auto`.** Machine-aware placement: with 2+ GPUs the small model is loaded whole on one GPU (`hermes sms swap <model> --gpu N`, `sms_swap(gpu=N)`) and the job gets another GPU (`$SMS_TASK_GPU`), so no reload is needed when it ends; with one GPU the LLM is unloaded during the job. New CLI `hermes sms job-layout`; `sms_plan` returns it as `gpu_job_auto`. Pinned layouts get their own VRAM profile.
+- **GPU job mode selector** in the dashboard and Desktop (setting `gpu_job_mode`): **Auto** (best for the machine), **None** (unload the LLM), **Nano** (keep the small model), **Multi** (small model on one GPU, another GPU for the job) and **Keep** (leave the loaded model alone). `gpu_job.sh auto` applies the selected mode; a mode that is not possible degrades to None and says why. API: `GET /state` → `gpu_job_modes`, `POST /gpu_job/mode`; CLI: `hermes sms job-layout --mode`.
+- **Auto-recover** (setting `auto_recover`, default on). A model that fails to load, or whose server dies while serving, is replaced by another model that fits (the primary first, then from small to big) instead of leaving the agent without an LLM. The watcher now runs for every model, the primary included. A model that just failed is not retried automatically for 30 minutes.
+- **Fix: crash on a single-GPU launch.** `-sm tensor|row` is dropped when the model can only use one GPU (pin, `--device X`, single `CUDA_VISIBLE_DEVICES`): llama-server loaded and then aborted on the first decode (`GGML_BACKEND_SPLIT_AXIS_UNKNOWN`).
+- **Fix: release gate inflated the need** of a model whose context was reduced (stale auto-raised `min_free_vram_gb`), blocking the primary although it fitted.
+- **Fix: idle restore never fired** while a resident process (e.g. an embeddings daemon) held any VRAM.
+- **Fix: drain cut live generations** after `drain_timeout_s`: llama.cpp's token totals only move when a request ends; progress now also follows `n_decode_total`.
+- No grace countdown when nothing is serving.
+
 ## 0.4.0
 
 **Automatic routing**

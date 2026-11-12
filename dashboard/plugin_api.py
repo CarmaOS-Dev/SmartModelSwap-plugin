@@ -408,6 +408,10 @@ class DeleteModelBody(BaseModel):
     name: str
 
 
+class GpuJobModeBody(BaseModel):
+    mode: str
+
+
 class SwapBody(BaseModel):
     model: Optional[str] = None
     dry_run: bool = False
@@ -511,6 +515,56 @@ def _preview(entry: dict, reg: dict) -> dict:
             "build": getattr(info, "version", "") if info else ""}
 
 
+def _gpu_job_modes() -> list:
+    """The modes of the UI selector, localized (id, label, description)."""
+    return [
+        {"id": "auto", "label": "Auto",
+         "description": t("Elige el mejor modo según tu equipo: Multi si hay 2 o más GPUs, None si solo hay una.",
+                          "Picks the best mode for your machine: Multi with 2+ GPUs, None with a single one.")},
+        {"id": "none", "label": "None",
+         "description": t("Descarga el modelo para dejar toda la VRAM al trabajo. Hermes queda sin modelo hasta que termina.",
+                          "Unloads the model so the job gets all the VRAM. Hermes has no model until it ends.")},
+        {"id": "nano", "label": "Nano",
+         "description": t("Carga el modelo pequeño para que Hermes no se quede sin modelo mientras el trabajo corre en segundo plano.",
+                          "Loads the small model so Hermes keeps a model while the job runs in the background.")},
+        {"id": "multi", "label": "Multi",
+         "description": t("Carga el modelo pequeño entero en una GPU y deja la otra libre para el trabajo pesado.",
+                          "Loads the small model whole on one GPU and leaves the other free for the heavy job.")},
+        {"id": "keep", "label": "Keep",
+         "description": t("No toca el modelo cargado: para trabajos ligeros que caben junto a él.",
+                          "Leaves the loaded model alone: for light jobs that fit beside it.")},
+    ]
+
+
+def _gpu_job_view(cfg: dict, status: dict) -> dict:
+    """Selected mode + what it means on this machine right now."""
+    mode = tools.gpu_job_mode()
+    vram = status.get("vram") if isinstance(status.get("vram"), list) else None
+    try:
+        lay = tools.job_layout(vram=vram or None)
+    except Exception as e:  # noqa: BLE001
+        lay = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    summary = ""
+    if lay.get("ok"):
+        ap, name, task = lay.get("applied"), lay.get("model"), lay.get("task_gpu")
+        on_task = t(f" Trabajo en GPU {task}.", f" Job on GPU {task}.") if task is not None and lay.get("gpus", 0) > 1 else ""
+        if ap == "multi":
+            summary = t(f"'{name}' entero en GPU {lay.get('llm_gpu')}.", f"'{name}' whole on GPU {lay.get('llm_gpu')}.") + on_task
+        elif ap == "nano":
+            summary = t(f"'{name}' sigue cargado durante el trabajo.", f"'{name}' stays loaded during the job.") + on_task
+        elif ap == "keep":
+            summary = (t(f"'{name}' se queda cargado; el trabajo corre a su lado.", f"'{name}' stays loaded; the job runs beside it.")
+                       if name else t("No hay modelo cargado; el trabajo corre tal cual.", "No model is loaded; the job runs as is."))
+        else:
+            summary = t("Sin modelo durante el trabajo; al terminar se carga uno para responder.",
+                        "No model during the job; one is loaded to answer when it ends.") + on_task
+        if lay.get("degraded"):
+            summary = t(f"'{lay.get('requested')}' no es posible ahora ({lay.get('reason')}). ",
+                        f"'{lay.get('requested')}' is not possible now ({lay.get('reason')}). ") + summary
+    return {"mode": mode, "modes": _gpu_job_modes(), "layout": lay, "summary": summary,
+            "after": tools.after_job_policy()}
+
+
 # ------------------------------------------------------------------------ endpoints
 
 @router.get("/state")
@@ -524,6 +578,7 @@ def state() -> dict:
         "status": status,
         "config": {"base_url": tools.base_url(reg), "primary_model": cfg["primary_model"],
                    "autostart_primary": cfg.get("autostart_primary")},
+        "gpu_job_modes": _gpu_job_view(cfg, status),
         "ui": ui,
         "active_engine": tools.active_engine_id(reg),
         "engines": engines_list(reg),
@@ -919,6 +974,21 @@ def provider_install() -> dict:
 @router.post("/provider/remove")
 def provider_remove() -> dict:
     return provider_sync.remove_provider()
+
+
+@router.post("/gpu_job/mode")
+def set_gpu_job_mode(body: GpuJobModeBody) -> dict:
+    """The UI selector: what `gpu_job.sh auto` does with the LLM during a GPU job."""
+    mode = body.mode.strip().lower()
+    if mode not in tools.GPU_JOB_MODES:
+        return {"ok": False, "error": t(f"modo desconocido: '{mode}'", f"unknown mode: '{mode}'"),
+                "modes": list(tools.GPU_JOB_MODES)}
+    res = set_setting("gpu_job_mode", mode)
+    if not res.get("ok"):
+        return {"ok": False, "error": t(f"no se pudo guardar el modo: {res.get('error')}",
+                                        f"could not save the mode: {res.get('error')}")}
+    cfg = resolve_cfg()
+    return {"ok": True, "mode": mode, **_gpu_job_view(cfg, json.loads(tools.h_status({})))}
 
 
 @router.post("/swap")

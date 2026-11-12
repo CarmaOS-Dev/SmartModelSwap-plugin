@@ -90,6 +90,21 @@ config_schema:
     label: Restore the primary after N idle minutes
     description: After a swap to a smaller model, bring the primary back once the engine has been idle this long (no tokens processed, no gpu_job.sh running, no other GPU users) and its VRAM is free. 0 disables it.
     default: 15
+  gpu_job_mode:
+    type: str
+    label: What to do with the LLM during a GPU job
+    description: 'Mode applied by `gpu_job.sh auto` (also selectable in the dashboard and Desktop). "auto" picks the best for this machine (multi with 2+ GPUs, otherwise none); "none" unloads the LLM; "nano" keeps the small model in its normal layout; "multi" loads the small model whole on one GPU and leaves another to the job; "keep" leaves the loaded model alone.'
+    default: auto
+  auto_recover:
+    type: bool
+    label: Swap to another model when one fails
+    description: If a model fails to load, or its server dies while serving, load another model that fits instead of leaving the agent without an LLM (the primary first, then from small to big). A model that just failed is not retried automatically for 30 minutes.
+    default: true
+  after_gpu_job:
+    type: str
+    label: Model that answers after a GPU job
+    description: '"small" (default) delivers the result with the small model — the one already loaded, or the smallest that fits if the LLM was unloaded for the job — and the primary comes back on demand (sms_restore) or after idle_restore_min. "primary" reloads the primary as soon as the job ends (slower reply).'
+    default: small
   block_when_unloaded:
     type: bool
     label: Answer at once while the LLM is unloaded on purpose

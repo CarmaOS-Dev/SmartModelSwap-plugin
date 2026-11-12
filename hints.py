@@ -103,10 +103,10 @@ def unloaded_veto(tools, busy_state: dict | None) -> dict | None:
                  "a GPU job is running and the model is being switched"))
         return {"action": "block", "message": t(
             f"⏳ Ahora mismo no puedo responder: {why} ({what}, lleva ~{mins} min). "
-            "Al terminar, el modelo principal vuelve solo y recibirás el resultado. "
+            "Al terminar vuelve un modelo solo y recibirás el resultado. "
             "Vuelve a enviar tu mensaje después de ese aviso.",
             f"⏳ I can't answer right now: {why} ({what}, ~{mins} min so far). "
-            "When it ends the main model comes back by itself and you'll get the result. "
+            "When it ends a model comes back by itself and you'll get the result. "
             "Please send your message again after that notice.")}
     if busy_state:
         action = busy_state.get("action") or "swap"
@@ -153,7 +153,8 @@ def build_context(tools, **kwargs) -> dict | None:
             + (f" (context {ctx_n} tokens)" if ctx_n else "")
             + f". The primary '{primary}' is unloaded to free VRAM"
             + (f"; it comes back by itself after {idle:g} idle minutes" if idle > 0 else "")
-            + f". Call sms_restore sooner if deep work is needed now ({tools.SKILL_REF}).")
+            + ". Answer simple requests (delivering a finished GPU job, chat, quick facts) on this "
+              f"model; call sms_restore only when deep work is asked for ({tools.SKILL_REF}).")
         if msg and DEEP_RX.search(msg) and _cooldown_ok(session, "deep", now):
             lines.append("[smart-model-swap] This looks like deep work and you are on the small model: "
                          "run `hermes sms check`, then `hermes sms restore --wait` (procedure B) "
@@ -162,7 +163,7 @@ def build_context(tools, **kwargs) -> dict | None:
         if msg and GPU_RX.search(msg) and _cooldown_ok(session, "gpu", now):
             lines.append("[smart-model-swap] If this needs ComfyUI/GPU work: the primary model holds "
                          "the GPU. Check `sms_plan(needed_free_gb=…, single_gpu=true)` and run the job "
-                         f"through {tools.gpu_job_script()} ({tools.SKILL_REF}, procedure A).")
+                         f"through `{tools.gpu_job_script()} auto -- <job>` ({tools.SKILL_REF}, procedure A).")
         voice_turn, clips = _voice_state(now)
         small = _smallest(tools)
         if (voice_turn and clips >= VOICE_MIN_CLIPS and settled and small

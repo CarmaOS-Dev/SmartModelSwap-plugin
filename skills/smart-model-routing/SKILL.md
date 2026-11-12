@@ -36,10 +36,11 @@ This skill decides which one to run and how to switch **without breaking the ses
 ## Decision matrix
 | Situation | Model | How |
 |---|---|---|
-| GPU job (ComfyUI, video, 3D, voice design…) | small, or `none` if it does not fit | **Procedure A** |
+| GPU job (ComfyUI, video, 3D, voice design…) | `auto`: small on one GPU + job on another (2+ GPUs), no LLM on a single GPU | **Procedure A** |
 | Deep analysis, code, debugging, research, planning, reviews, writing for others | big | **Procedure B** |
 | Casual or voice chat that needs quick replies (greetings, small talk, quick facts, reminders) | small | **Procedure C** |
-| GPU job or voice session over, or heavy work arrives on the small model | big | **Procedure D** |
+| GPU job over: deliver the result, comment on it, simple follow-ups | **small** (the one left loaded) | change nothing; the big one returns by itself when idle |
+| Voice session over, or heavy work arrives on the small model | big | **Procedure D** |
 | Cron / scheduled task | big, unless the cron *is* the GPU job | a cron **never** leaves the small model loaded |
 | A swap is in progress (`sms_status` → `swap.state` ≠ `idle`) | none | wait (`hermes sms wait`); never start another |
 
@@ -71,22 +72,29 @@ The big model usually fills most of the VRAM of every GPU it uses. It loads only
    - after stopping the current model, the runner waits up to `release_wait_s` for the VRAM;
    - if it is not freed, the runner reloads the previous (or smallest fitting) model instead, so you are never left without a brain. `runner.log` shows `RESOURCES NOT RELEASED`.
 
-## Procedure A: GPU-heavy job (free → work → back to big)
+## Procedure A: GPU-heavy job (free → work → answer on the small model)
 1. **Measure.** Call `sms_plan(needed_free_gb=<the job's VRAM>, task=…)`.
 2. **Choose by `action`:**
    - `stay`: change nothing and run the task on `task_gpu`;
    - `swap`: switch to `target`, usually the small model;
    - `unload`: use `none`, which means no LLM during the job;
    - `impossible`: tell the user it does not fit.
-3. **Run everything as one background job** with the bundled template:
+3. **Run everything as one background job** with the bundled template, normally in `auto` mode:
    ```bash
-   bash ~/.hermes/plugins/smart-model-swap/skills/smart-model-routing/templates/gpu_job.sh <small-model|none> -- bash /path/to/my_job.sh
+   bash ~/.hermes/plugins/smart-model-swap/skills/smart-model-routing/templates/gpu_job.sh auto -- bash /path/to/my_job.sh
    ```
+   - `auto` applies the mode **the user chose in the UI** (setting `gpu_job_mode`): `auto`, `none`, `nano` (small model kept in its normal layout), `multi` (small model on one GPU, another for the job) or `keep` (the loaded model is left alone). Do not override the user's choice with an explicit mode unless they ask. `sms_plan` → `gpu_job_auto` (or `hermes sms job-layout`) shows what will happen; the log line `MODE: asked=… applied=…` shows what did.
+   - With the default mode (`auto`) the plugin places things for the machine:
+     - **2+ GPUs:** the small model is loaded whole on one GPU and the job gets another GPU to itself. You keep a model during the job and answer as soon as it ends, with no reload.
+     - **1 GPU** (or the small model does not fit on a single GPU): the LLM is unloaded during the job, like `none`.
+   - The job must run on the GPU in `$SMS_TASK_GPU` (ComfyUI: `--cuda-device "${SMS_TASK_GPU:-0}"`). Prefix `TASK_GPU=<n>` to force it.
+   - If the job needs more VRAM than one GPU has free (`gpu_job_auto.free_without_llm_gib`), it does not fit in `auto`: use `none` when the job can spread over all GPUs, otherwise tell the user.
+   - A model name or `none` instead of `auto` still forces that mode.
    - Launch it with the terminal tool, `background=true`, `notify_on_complete=true`. The plugin blocks it in the foreground.
    - `my_job.sh` must start ComfyUI (on `task_gpu`), submit the workflow, fetch the result, **stop ComfyUI** by exact PID, and print `SAVED=<path>`.
-   - The template frees VRAM through SMP, runs the job and **always** restores the big model before it exits.
+   - The template frees VRAM through SMP, runs the job and **always** leaves a model serving before it exits: the **small** one (the one already loaded; with `none`, the smallest that fits). It does not reload the big model, so the result is delivered without a multi-minute wait (setting `after_gpu_job`; `primary` brings back the old behaviour).
 4. **Reply in one sentence and END the turn**, for example "Generating it; freeing the GPU, back in a few minutes". After launching `gpu_job.sh`, make **no further tool or model calls**, not even to poll: the model running you is about to be unloaded. The swap waits 10 s and lets your reply finish first.
-5. **When the completion notification arrives** (you are on the big model again), check the log for `RESULT job_rc=0`, `RESULT restore=ok` and `SAVED=`, then deliver the result. `RESULT restore=BLOCKED` means the VRAM was not freed: apply the release check, then `sms_restore`.
+5. **When the completion notification arrives** (you are on the small model), check the log for `RESULT job_rc=0`, `RESULT model=<name> (restore=ok)` and `SAVED=`, then deliver the result **on that model, without switching**. Stay on it for comments and simple requests; load the big model only when the user asks for deep work (Procedure B). `RESULT restore=FAILED` means no model is serving: see **If something fails**.
 
 ## Procedure B: deep work (load the big model)
 1. If `sms_status` shows the big model, just work.
@@ -103,8 +111,7 @@ The big model usually fills most of the VRAM of every GPU it uses. It loads only
 4. Exception: if TTS/ASR fails for lack of VRAM with the big model loaded, switching to small fixes it even for a short exchange.
 
 ## Procedure D: back to the big model
-Restore when any of these holds:
-- the GPU job is over (the `gpu_job.sh` template already does it);
+The end of a GPU job is **not** a reason to restore: the result is delivered on the small model. Restore when any of these holds:
 - the voice or casual session ended;
 - a task for the big model arrives (Procedure B);
 - a `[smart-model-swap]` line reminds you the primary is unloaded and there is no reason left for the small one.
@@ -113,6 +120,7 @@ To restore: `hermes sms check --wait 120`, then `sms_restore()` as the last tool
 
 ## What the plugin does on its own
 - **Idle restore.** After any swap to a smaller model, a watcher brings the primary back once the engine has been idle for `idle_restore_min` minutes (default 15) and the release check passes.
+- **Auto-recover.** If a model fails to load, or its server dies while serving, the plugin loads another model that fits (the primary first, then from small to big). `sms_status` → `last_result.detail.fallback` and `runner.log` (`auto-recover`) say which one. A model that just failed is not retried automatically for 30 min: do not force it back; report the error from `llama-<model>.log`.
 - **Guard.** `terminal` / `execute_code` calls that stop, kill or launch `llama-server` by hand are blocked. So is a ComfyUI launch while the primary holds the GPU, unless it goes through `gpu_job.sh` or carries `SMS_ALLOW_GPU=1` (only after `sms_plan` said `stay`). The block message says what to use instead.
 - **Hints.** You get one `[smart-model-swap]` line when:
   - an image or video is requested on the big model;

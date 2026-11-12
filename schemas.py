@@ -82,6 +82,10 @@ SWAP_SCHEMA = {
                 "type": "string",
                 "description": "Target model name from the model registry (e.g. 'qwen', 'signal').",
             },
+            "gpu": {
+                "type": "integer",
+                "description": "Optional: load the model whole on this GPU (nvidia-smi index), leaving the other GPUs free for a GPU job. Omit for the model's normal layout.",
+            },
             "dry_run": {
                 "type": "boolean",
                 "description": "Validate files, VRAM fit and runner liveness without starting anything. Default false.",

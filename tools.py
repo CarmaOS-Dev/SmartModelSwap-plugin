@@ -58,6 +58,9 @@ DEFAULTS: dict = {
     "guard_tools": True,
     "block_when_unloaded": True,
     "idle_restore_min": 15,
+    "after_gpu_job": "small",
+    "gpu_job_mode": "auto",
+    "auto_recover": True,
     "isolate_scope": True,
     # Legacy (<= 0.2): read once to migrate models.json to v2, then unused.
     "llama_bin": "",
@@ -86,7 +89,7 @@ def apply_cfg(cfg: dict) -> None:
         v = cfg.get(k)
         if v not in (None, ""):
             merged[k] = v
-    for k in ("inject_status", "autostart_primary", "isolate_scope"):
+    for k in ("inject_status", "autostart_primary", "isolate_scope", "auto_recover"):
         merged[k] = _as_bool(merged[k])
     _CFG = merged
 
@@ -1109,13 +1112,54 @@ def idle_watch_status() -> dict | None:
     return info if _pid_alive(info.get("pid")) else None
 
 
+FAILURE_WINDOW_S = 30 * 60
+
+
+def note_failure(name: str, why: str = "") -> None:
+    """Remember that `name` failed to load or died, so the automatic fallbacks
+    do not pick it again for a while (no crash loops). Explicit swaps ignore it."""
+    hist = [f for f in (read_state().get("failures") or []) if isinstance(f, dict)]
+    hist.append({"model": name, "at": time.time(), "why": str(why)[:200]})
+    write_state({"failures": hist[-10:]})
+
+
+def recent_failures(window_s: float = FAILURE_WINDOW_S) -> set:
+    now = time.time()
+    return {str(f.get("model")) for f in (read_state().get("failures") or [])
+            if isinstance(f, dict) and now - float(f.get("at") or 0) <= window_s}
+
+
+def crashed_model() -> str | None:
+    """Name of the model whose server died on its own: the state still records
+    a running server (a deliberate stop clears it) but its process is gone."""
+    srv = read_state().get("server") or {}
+    if srv.get("model") and srv.get("pid") and not _pid_alive(srv.get("pid")):
+        return str(srv["model"])
+    return None
+
+
+def recovery_candidates(failed: str | None, prefer: list | None = None) -> list[str]:
+    """Models to try, in order, when `failed` could not be loaded or died:
+    `prefer` first, then the primary, then the rest from small to big. Skips
+    `failed` and everything that failed in the last FAILURE_WINDOW_S."""
+    bad = recent_failures() | ({failed} if failed else set())
+    models = sorted(load_models().get("models", []),
+                    key=lambda m: float(m.get("min_free_vram_gb") or 0))
+    primary = find_model(str(get_cfg().get("primary_model") or ""))
+    order = [n for n in (prefer or []) if n]
+    order += ([primary["name"]] if primary else []) + [m["name"] for m in models]
+    return [n for n in dict.fromkeys(order) if n not in bad and find_model(n)]
+
+
 def spawn_idle_watch(target: str) -> dict:
-    """Start the watcher for `target` unless disabled or one is already running."""
+    """Start the watcher for `target` unless disabled or one is already running.
+    It restores the primary when idle (non-primary models) and swaps to another
+    model if the one serving dies (auto_recover)."""
     cfg = get_cfg()
-    if float(cfg.get("idle_restore_min") or 0) <= 0:
-        return {"ok": True, "skipped": "idle_restore_min is 0 (disabled)"}
-    if same_name(target, cfg.get("primary_model")):
-        return {"ok": True, "skipped": "target is the primary"}
+    idle_on = (float(cfg.get("idle_restore_min") or 0) > 0
+               and not same_name(target, cfg.get("primary_model")))
+    if not idle_on and not cfg.get("auto_recover", True):
+        return {"ok": True, "skipped": "nothing to watch (primary, or idle restore off) and auto_recover is off"}
     cur = idle_watch_status()
     if cur:
         return {"ok": True, "skipped": f"watcher already running (pid {cur.get('pid')})"}
@@ -1132,8 +1176,8 @@ def spawn_idle_watch(target: str) -> dict:
 def ensure_idle_watch() -> dict:
     """Gateway start-up: a non-primary model is serving but nobody watches it."""
     current = match_model(llm_health(timeout=2.0))
-    if not current or same_name(current, get_cfg().get("primary_model")) or busy_state():
-        return {"ok": True, "skipped": "primary loaded, nothing loaded or busy"}
+    if not current or busy_state():
+        return {"ok": True, "skipped": "nothing loaded or busy"}
     return spawn_idle_watch(current)
 
 
@@ -1245,7 +1289,26 @@ def load_vram_profile() -> dict:
         return {}
 
 
-def record_vram_profile(name: str, before: list[dict], after: list[dict]) -> dict | None:
+def profile_key(name: str, pin=None) -> str:
+    """A model pinned to one GPU takes a different share than its normal
+    multi-GPU layout: it gets its own profile entry."""
+    return name if pin is None else f"{name}@gpu{int(pin)}"
+
+
+def serving_entry(current: str | None, data: dict | None = None) -> dict | None:
+    """Registry entry of the model serving now, carrying the GPU pin it was
+    launched with (so the VRAM it gives back is credited to the right GPU)."""
+    entry = find_model(current, data) if current else None
+    if not entry:
+        return None
+    srv = read_state().get("server") or {}
+    if srv.get("pin_gpu") is not None and same_name(srv.get("model"), entry["name"]) \
+            and _pid_alive(srv.get("pid")):
+        entry = dict(entry, pin_gpu=int(srv["pin_gpu"]))
+    return entry
+
+
+def record_vram_profile(name: str, before: list[dict], after: list[dict], pin=None) -> dict | None:
     """Per-GPU VRAM a model took on load (after - before). Skipped when the
     delta is implausibly small (another process freed VRAM meanwhile)."""
     b = {g["gpu"]: g["used_mib"] for g in before or []}
@@ -1253,18 +1316,23 @@ def record_vram_profile(name: str, before: list[dict], after: list[dict]) -> dic
     for g in after or []:
         if g["gpu"] in b:
             per[str(g["gpu"])] = max(0, g["used_mib"] - b[g["gpu"]])
+    if pin is not None:
+        per = {k: v for k, v in per.items() if k == str(int(pin))}
+    key = profile_key(name, pin)
     entry = find_model(name) or {}
     floor = 0.5 * float(entry.get("min_free_vram_gb", 0)) * 1024
     if not per or sum(per.values()) < max(512.0, floor):
         return None
     prof = load_vram_profile()
-    old = prof.get(name) or {}
+    old = prof.get(key) or {}
     hist = [h for h in (old.get("history") or []) if isinstance(h, dict) and h.get("per_gpu_mib")]
     ctx = model_ctx(entry) if entry else None
     hist.append({"per_gpu_mib": per, "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "ctx": ctx})
     hist = hist[-5:]
-    med = _profile_median(hist, ctx) or per
-    prof[name] = {"per_gpu_mib": med, "at": hist[-1]["at"], "ctx": ctx, "history": hist}
+    on = {int(pin)} if pin is not None else (
+        layout_gpus(entry, [g["gpu"] for g in after or []]) if entry else None)
+    med = _profile_median(hist, ctx, on) or per
+    prof[key] = {"per_gpu_mib": med, "at": hist[-1]["at"], "ctx": ctx, "history": hist}
     p = vram_profile_file()
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(prof, indent=2))
@@ -1273,7 +1341,7 @@ def record_vram_profile(name: str, before: list[dict], after: list[dict]) -> dic
         _raise_declared_min(name, sum(med.values()) / 1024.0)
     except Exception:  # noqa: BLE001 - the profile is what matters; the registry is cosmetic
         pass
-    return prof[name]
+    return prof[key]
 
 
 def _raise_declared_min(name: str, measured_gib: float) -> float | None:
@@ -1293,11 +1361,32 @@ def _raise_declared_min(name: str, measured_gib: float) -> float | None:
     return None
 
 
-def _profile_median(hist: list, ctx: int | None) -> dict | None:
+def layout_gpus(entry: dict, gpus: list[int], data: dict | None = None) -> set | None:
+    """Physical GPUs the model's launch flags put it on, or None if unknown."""
+    try:
+        data = load_models() if data is None else data
+        eng, ecfg = model_engine(entry, data)
+        split = eng.gpu_split(ecfg, entry, launch_args(entry, data), gpus)
+    except Exception:  # noqa: BLE001
+        return None
+    return set(split) if split else None
+
+
+def _same_layout(hist: list, on: set | None) -> list:
+    """Loads made on the same set of GPUs as the current flags. After the user
+    moves a model (--device / -ts / CUDA_VISIBLE_DEVICES) the older deltas
+    describe another placement and must not be mixed in."""
+    if not on:
+        return list(hist)
+    return [h for h in hist
+            if {int(g) for g, v in (h.get("per_gpu_mib") or {}).items() if v > 256} == on]
+
+
+def _profile_median(hist: list, ctx: int | None, on: set | None = None) -> dict | None:
     """Per-GPU median over the loads made with context `ctx` (entries without a
-    recorded ctx count as matching). Other processes growing or shrinking
-    during a load skew a single delta by a few hundred MiB either way."""
-    same = [h for h in hist if h.get("ctx") in (None, ctx)]
+    recorded ctx count as matching) on the GPU set `on`. Other processes growing
+    or shrinking during a load skew a single delta by a few hundred MiB either way."""
+    same = [h for h in _same_layout(hist, on) if h.get("ctx") in (None, ctx)]
     if not same:
         return None
     med = {}
@@ -1310,16 +1399,33 @@ def _profile_median(hist: list, ctx: int | None) -> dict | None:
 def model_gpu_need(entry: dict, gpus: list[int], data: dict | None = None) -> dict:
     """{"per_gpu": {gpu: GiB}, "source": measured|estimated|total, "total_gib"}."""
     total = float(entry.get("min_free_vram_gb", 0))
+    pin = entry.get("pin_gpu")
+    if pin is not None:
+        pin = int(pin)
+        rec = load_vram_profile().get(profile_key(entry["name"], pin)) or {}
+        med = _profile_median(rec.get("history") or [], model_ctx(entry))
+        if med and str(pin) in med:
+            gib = med[str(pin)] / 1024.0
+            return {"per_gpu": {pin: gib}, "source": "measured", "total_gib": gib}
+        # never loaded on this GPU alone yet: everything it takes when spread, on one GPU
+        spread = model_gpu_need({k: v for k, v in entry.items() if k != "pin_gpu"}, gpus, data)
+        return {"per_gpu": {pin: spread["total_gib"]}, "source": "estimated",
+                "total_gib": spread["total_gib"]}
     rec = load_vram_profile().get(entry["name"]) or {}
     prof = rec.get("per_gpu_mib") or {}
     source = "measured"
     if rec.get("history"):
         cur_ctx = model_ctx(entry)
-        med = _profile_median(rec["history"], cur_ctx)
+        on = layout_gpus(entry, gpus, data)
+        med = _profile_median(rec["history"], cur_ctx, on)
+        placed = _same_layout(rec["history"], on)
         if med:
             prof = med
-        elif prof:
+        elif placed:
+            prof = placed[-1]["per_gpu_mib"]
             source = "measured-other-ctx"  # context changed since: a guess until the next load
+        else:
+            prof = {}  # never loaded on these GPUs: estimate from the flags below
     if prof:
         per = {int(k): v / 1024.0 for k, v in prof.items() if int(k) in gpus}
         # A measurement taken with another context is a guess: never let it go
@@ -1408,7 +1514,7 @@ def check_release(name: str, wait_s: float = 0.0, poll_s: float = 5.0) -> dict:
         current = match_model(llm_health(timeout=1.5))
         if current == entry["name"]:
             return {"ok": True, "model": entry["name"], "summary": f"'{current}' is already loaded"}
-        rc = release_check(entry, unloading=find_model(current) if current else None)
+        rc = release_check(entry, unloading=serving_entry(current))
         rc["unloading"] = current
         if rc["ok"] or time.time() >= deadline:
             return rc
@@ -1483,7 +1589,7 @@ def launch_args(entry: dict, data: dict | None = None) -> list[str]:
         clean, _ = normalize_params({k: v for k, v in entry["presets"][name].items()
                                      if k in PARAM_RANGES})
         args = apply_params_to_args(args, clean)
-    return args
+    return eng.finalize_args(ecfg, entry, args)
 
 
 def build_cmd(entry: dict, data: dict | None = None) -> list[str]:
@@ -1525,11 +1631,11 @@ def start_model(entry: dict) -> dict:
                                 cwd=os.path.dirname(argv[0]) or None,
                                 start_new_session=True)
     write_state({"server": {"mode": "smp", "engine": eng.id, "unit": scope,
-                            "pid": proc.pid, "model": name}})
+                            "pid": proc.pid, "model": name, "pin_gpu": entry.get("pin_gpu")}})
     res = wait_health(entry, "scope" if scope else "session", proc=proc)
     if res.get("ok"):
         try:
-            prof = record_vram_profile(name, vram_before, get_vram())
+            prof = record_vram_profile(name, vram_before, get_vram(), pin=entry.get("pin_gpu"))
             if prof:
                 res["vram_per_gpu_mib"] = prof["per_gpu_mib"]
         except Exception:  # noqa: BLE001 - measuring must never fail a good load
@@ -1648,14 +1754,14 @@ def preflight(cfg_entry: dict, need_extra_gb: float = 0.0, swap: bool = True) ->
         detail = f"free {avail:.1f} GiB >= need {need:.1f} GiB"
     checks.append({"check": "VRAM fit", "ok": avail >= need, "detail": detail})
     current = match_model(llm_health(timeout=1.5)) if swap else None
-    rc = release_check(cfg_entry, unloading=find_model(current) if current else None)
+    rc = release_check(cfg_entry, unloading=serving_entry(current))
     checks.append({"check": "heavy GPU processes released (VRAM per GPU)", "ok": rc["ok"],
                    "detail": rc["summary"]})
     return {"ok": all(c["ok"] for c in checks), "checks": checks,
             "available_gb": round(avail, 1)}
 
 
-def spawn_runner(action: str, target: str, grace: int | None = None) -> dict:
+def spawn_runner(action: str, target: str, grace: int | None = None, pin=None) -> dict:
     """Detached runner: grace sleep -> drain -> stop -> start -> state update."""
     cfg = get_cfg()
     b64 = base64.b64encode(json.dumps(cfg).encode()).decode()
@@ -1665,6 +1771,7 @@ def spawn_runner(action: str, target: str, grace: int | None = None) -> dict:
         "action": action,
         "target": target,
         "grace_until": time.time() + grace,
+        "pin_gpu": None if pin is None else int(pin),
         "runner_pid": None,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
@@ -1806,7 +1913,7 @@ def h_plan(args: dict, **kwargs) -> str:
         comfy = comfy_status()
         data = load_models()
         current = match_model(llm_health())
-        cur_entry = find_model(current, data) if current else None
+        cur_entry = serving_entry(current, data)
 
         def per_gpu_need(entry: dict) -> tuple[dict, dict]:
             n = model_gpu_need(entry, gpus, data)
@@ -1874,6 +1981,8 @@ def h_plan(args: dict, **kwargs) -> str:
             "recommendation": rec, "action": action,
             "target": (fitting[-1]["name"] if action == "swap" else
                        current if action == "stay" else None),
+            # what `gpu_job.sh auto` will do on this machine
+            "gpu_job_auto": job_layout(),
         })
     except Exception as e:  # noqa: BLE001
         return jdump({"ok": False, "error": f"{type(e).__name__}: {e}"})
@@ -1885,9 +1994,13 @@ def _launch(action: str, entry: dict, dry: bool, extra: dict, force: bool = Fals
     `force` (a reload costs minutes without any LLM for every session).
     """
     name = entry["name"]
+    pin = entry.get("pin_gpu")
     if not dry and not force and not busy_state():
         current = match_model(llm_health(timeout=2.0))
-        if current == name:
+        serving = serving_entry(current) or {}
+        same_place = serving.get("pin_gpu") == pin or (
+            pin is not None and layout_gpus(serving, [g["gpu"] for g in get_vram()]) == {int(pin)})
+        if current == name and same_place:
             return jdump({"ok": True, "skipped": f"'{name}' is already loaded; nothing to do",
                           "current": name, "server": describe_server(detect_server())})
     pf = preflight(entry)
@@ -1906,7 +2019,9 @@ def _launch(action: str, entry: dict, dry: bool, extra: dict, force: bool = Fals
         busy = busy_state()
         if busy:
             return jdump({"ok": False, "error": f"swap already in progress (state: {busy})"})
-        return jdump(spawn_runner(action, name))
+        # Nothing is serving: there is no reply to protect, so skip the grace.
+        grace = None if llm_health(timeout=2.0).get("up") else 0
+        return jdump(spawn_runner(action, name, grace, pin))
 
 
 def wait_idle(timeout_s: float = 900.0, target: str | None = None, poll_s: float = 3.0) -> dict:
@@ -1937,6 +2052,157 @@ def wait_idle(timeout_s: float = 900.0, target: str | None = None, poll_s: float
     return out
 
 
+GPU_JOB_MODES = ("auto", "none", "nano", "multi", "keep")
+
+
+def gpu_job_mode() -> str:
+    v = str(get_cfg().get("gpu_job_mode") or "auto").strip().lower()
+    return v if v in GPU_JOB_MODES else "auto"
+
+
+def job_layout(task_gpu=None, model: str | None = None, mode: str | None = None,
+               vram: list[dict] | None = None) -> dict:
+    """Where the LLM and a GPU job (ComfyUI …) go — what `gpu_job.sh auto` does.
+
+    `mode` (default: the gpu_job_mode setting, picked in the UI):
+      auto   best for this machine: `multi` with 2+ GPUs, else `none`.
+      none   unload the LLM during the job (all the VRAM goes to the job).
+      nano   keep the small model, in its normal layout, next to the job.
+      multi  small model whole on ONE GPU, another GPU left to the job.
+      keep   leave the loaded model alone (light jobs that fit beside it).
+    A mode that cannot be honoured degrades to `none` and says why.
+
+    Returns `mode`: what the script must do — "small" (swap to `model`, pinned
+    to `llm_gpu` when set), "none" (unload) or "keep" (touch nothing) — and
+    `applied`: the named mode that ends up in effect.
+    """
+    requested = str(mode or gpu_job_mode()).strip().lower()
+    if requested not in GPU_JOB_MODES:
+        return {"ok": False, "error": f"unknown mode '{requested}'", "modes": list(GPU_JOB_MODES)}
+    vram = get_vram() if vram is None else vram
+    gpus = [g["gpu"] for g in vram]
+    data = load_models()
+    current = match_model(llm_health(timeout=2.0))
+    cur = serving_entry(current, data)
+    credit = (model_gpu_need(cur, gpus, data)["per_gpu"] or {}) if cur else {}
+    base = {g["gpu"]: g["free_mib"] / 1024.0 + credit.get(g["gpu"], 0.0) for g in vram}
+    if task_gpu is not None and str(task_gpu) != "":
+        task_gpu = int(task_gpu)
+        if task_gpu not in gpus:
+            return {"ok": False, "error": f"no GPU {task_gpu} on this machine"}
+    else:
+        task_gpu = max(gpus, key=lambda g: (base[g], -g)) if gpus else None
+    out = {"ok": True, "requested": requested, "applied": "none", "mode": "none", "model": None,
+           "llm_gpu": None, "task_gpu": task_gpu, "gpus": len(gpus), "current": current,
+           "free_without_llm_gib": {str(g): round(v, 1) for g, v in base.items()}}
+
+    def done(applied: str, script_mode: str, reason: str, **kw) -> dict:
+        out.update(applied=applied, mode=script_mode, reason=reason, **kw)
+        out["degraded"] = requested not in ("auto", applied)
+        return out
+
+    if requested == "none":
+        return done("none", "none", "the LLM is unloaded during the job")
+    if requested == "keep":
+        return done("keep", "keep", f"'{current}' stays loaded; the job runs beside it" if current
+                    else "nothing is loaded; the job runs as is", model=current)
+
+    models = sorted(data.get("models", []), key=lambda m: float(m.get("min_free_vram_gb") or 0))
+    small = find_model(str(model), data) if model else (models[0] if models else None)
+    if not small:
+        return done("none", "none", "no model in the registry: the LLM is unloaded during the job")
+    name = small["name"]
+
+    if requested == "nano":
+        rc = release_check(small, unloading=cur, vram=vram)
+        if current == name or rc["ok"]:
+            return done("nano", "small", f"'{name}' stays loaded in its normal layout during the job",
+                        model=name)
+        return done("none", "none", f"'{name}' does not fit now ({rc['summary'].split(';')[0]}): "
+                                    "the LLM is unloaded during the job")
+
+    # multi / auto
+    if len(gpus) < 2:
+        return done("none", "none", "single GPU: the LLM is unloaded during the job")
+    for g in sorted((g for g in gpus if g != task_gpu), key=lambda g: (-base[g], g)):
+        need = model_gpu_need(dict(small, pin_gpu=g), gpus, data)
+        margin = RELEASE_MARGIN_GIB.get(need["source"], 0.5)
+        if base[g] >= need["total_gib"] + margin:
+            return done("multi", "small", f"'{name}' whole on GPU {g}; GPU {task_gpu} is left to the job",
+                        model=name, llm_gpu=g, llm_need_gib=round(need["total_gib"], 1))
+    return done("none", "none", f"'{name}' does not fit on one GPU next to the job: "
+                                "the LLM is unloaded during it")
+
+
+def after_job_policy() -> str:
+    v = str(get_cfg().get("after_gpu_job") or "small").strip().lower()
+    return v if v in ("small", "primary") else "small"
+
+
+def after_job(prefer: str | None = None, timeout_s: float = 900.0) -> dict:
+    """What gpu_job.sh runs when the GPU job ends: make sure the agent has a
+    brain to deliver the result with.
+
+    after_gpu_job = "small" (default): answer with the small model. A
+    registered model that is already serving stays (no reload at all);
+    when the LLM was unloaded for the job, the smallest model that fits is
+    loaded (`prefer` first). The primary comes back later: on demand
+    (sms_restore, when deep work arrives) or through the idle watcher.
+
+    after_gpu_job = "primary": reload the primary right away (the old
+    behaviour); if its VRAM is not released, fall back to the small path
+    instead of leaving the agent without a model.
+    """
+    cfg = get_cfg()
+    primary = str(cfg.get("primary_model") or "")
+    policy = after_job_policy()
+    out: dict = {"policy": policy}
+    current = match_model(llm_health(timeout=3.0))
+
+    def launch(name: str) -> dict:
+        res = json.loads(h_restore({}) if same_name(name, primary) else h_swap({"model": name}))
+        if res.get("ok") and not res.get("skipped"):
+            res = wait_idle(timeout_s, name)
+        return res
+
+    if policy == "primary" and not same_name(current, primary):
+        rc = check_release(primary, float(cfg.get("release_wait_s") or 0))
+        if rc.get("ok"):
+            res = launch(primary)
+            if res.get("ok"):
+                return {**out, "ok": True, "current": primary, "loaded": primary}
+            out["primary_error"] = res.get("error")
+        else:
+            out["primary_blocked"] = rc.get("summary")
+        current = match_model(llm_health(timeout=3.0))
+
+    if current:
+        if not same_name(current, primary):
+            ensure_idle_watch()
+        return {**out, "ok": True, "current": current, "loaded": None,
+                "note": f"'{current}' is already serving; nothing reloaded"}
+
+    models = sorted(load_models().get("models", []),
+                    key=lambda m: float(m.get("min_free_vram_gb") or 0))
+    names = [m["name"] for m in models]
+    pref = find_model(str(prefer)) if prefer else None
+    if pref:
+        names = [pref["name"]] + [n for n in names if n != pref["name"]]
+    errors = {}
+    for name in names:
+        rc = release_check(find_model(name))
+        if not rc["ok"]:
+            errors[name] = rc["summary"]
+            continue
+        res = launch(name)
+        if res.get("ok"):
+            return {**out, "ok": True, "current": name, "loaded": name}
+        errors[name] = res.get("error")
+        break  # a load was attempted and failed: do not chain multi-minute retries
+    return {**out, "ok": False, "current": match_model(llm_health(timeout=3.0)),
+            "error": "no model could be loaded after the GPU job", "tried": errors}
+
+
 def _cmd_extra(entry: dict) -> dict:
     try:
         return {"cmd": smp_cmdline.join(build_cmd(entry))}
@@ -1951,6 +2217,12 @@ def h_swap(args: dict, **kwargs) -> str:
         if not entry:
             return jdump({"ok": False, "error": f"unknown model '{name}'",
                           "available": available_models()})
+        gpu = args.get("gpu")
+        if gpu is not None and str(gpu) != "":
+            gpu = int(gpu)
+            if gpu not in [g["gpu"] for g in get_vram()]:
+                return jdump({"ok": False, "error": f"no GPU {gpu} on this machine"})
+            entry = dict(entry, pin_gpu=gpu)
         return _launch("swap", entry, bool(args.get("dry_run", False)), _cmd_extra(entry),
                        force=bool(args.get("force", False)))
     except Exception as e:  # noqa: BLE001
@@ -2005,6 +2277,7 @@ def setup_sms(parser) -> None:
     p.add_argument("model")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true", help="Reload even if the model is already serving")
+    p.add_argument("--gpu", type=int, default=None, help="Load the model whole on this GPU (nvidia-smi index), leaving the others free")
     p.add_argument("--wait", action="store_true", help="Block until the swap finishes; exit 0 only if the target is serving")
     p.add_argument("--timeout", type=float, default=900, help="Max seconds for --wait (default 900)")
     p = sub.add_parser("restore", help="Restore the primary model (background, with grace)")
@@ -2018,6 +2291,14 @@ def setup_sms(parser) -> None:
     p = sub.add_parser("wait", help="Block until no swap/restore/start is in flight, then print the result")
     p.add_argument("--timeout", type=float, default=900)
     p.add_argument("--target", default=None, help="Exit 0 only if this model is the one serving")
+    p = sub.add_parser("job-layout", help="Where the LLM and a GPU job go: small model on one GPU + job on another (2+ GPUs), or no LLM (1 GPU); used by gpu_job.sh auto")
+    p.add_argument("--task-gpu", type=int, default=None, help="GPU the job will use (default: the one with most room)")
+    p.add_argument("--model", default=None, help="Model to keep during the job (default: the smallest)")
+    p.add_argument("--mode", default=None, choices=list(GPU_JOB_MODES), help="Mode to apply (default: the gpu_job_mode setting chosen in the UI)")
+    p.add_argument("--plain", action="store_true", help="One line for scripts: <small|none|keep> <model|-> <llm_gpu|-> <task_gpu|-> <applied mode>")
+    p = sub.add_parser("after-job", help="End of a GPU job: keep/load the model that will answer (setting after_gpu_job); used by gpu_job.sh")
+    p.add_argument("--prefer", default=None, help="Model to load first if nothing is serving")
+    p.add_argument("--timeout", type=float, default=900)
     sub.add_parser("start", help="Load the primary model now if nothing is serving (what the gateway does at start-up)")
     p = sub.add_parser("stop", help="Stop the model served by the active engine")
     p.add_argument("--graceful", action="store_true",
@@ -2039,7 +2320,7 @@ def cli_sms(args) -> int:
     elif cmd in ("swap", "restore"):
         if cmd == "swap":
             out = h_swap({"model": a.get("model"), "dry_run": a.get("dry_run", False),
-                          "force": a.get("force", False)})
+                          "force": a.get("force", False), "gpu": a.get("gpu")})
             target = a.get("model")
         else:
             out = h_restore({"dry_run": a.get("dry_run", False), "force": a.get("force", False)})
@@ -2054,6 +2335,16 @@ def cli_sms(args) -> int:
                                   float(a.get("wait") or 0)))
     elif cmd == "wait":
         out = jdump(wait_idle(float(a.get("timeout") or 900), a.get("target") or None))
+    elif cmd == "job-layout":
+        lay = job_layout(a.get("task_gpu"), a.get("model"), a.get("mode"))
+        if a.get("plain") and lay.get("ok"):
+            dash = lambda v: "-" if v is None else str(v)  # noqa: E731
+            print(lay["mode"], dash(lay["model"]), dash(lay["llm_gpu"]), dash(lay["task_gpu"]),
+                  lay["applied"])
+            return 0
+        out = jdump(lay)
+    elif cmd == "after-job":
+        out = jdump(after_job(a.get("prefer") or None, float(a.get("timeout") or 900)))
     elif cmd == "start":
         out = jdump(autostart_primary())
     elif cmd == "stop":

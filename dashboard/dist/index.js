@@ -174,8 +174,15 @@
       unregisteredModel: "modelo no registrado",
       startingUp: "arrancando…",
       gpuJobUnloaded: "LLM descargado por un trabajo de GPU",
-      gpuJobUnloadedNote: (job, min) => "Trabajo en curso" + (job ? " (" + job + ")" : "") + ", " + min + " min. El modelo primario vuelve solo al terminar; no hagas swap mientras tanto.",
-      gpuJobRunningNote: (job, min) => "Trabajo de GPU en curso" + (job ? " (" + job + ")" : "") + ", " + min + " min. El modelo primario vuelve solo al terminar.",
+      gpuJobUnloadedNote: (job, min) => "Trabajo en curso" + (job ? " (" + job + ")" : "") + ", " + min + " min. Al terminar vuelve un modelo solo; no hagas swap mientras tanto.",
+      gpuJobRunningNote: (job, min) => "Trabajo de GPU en curso" + (job ? " (" + job + ")" : "") + ", " + min + " min. Al terminar sigue respondiendo el modelo cargado.",
+      gpuModeTitle: "Trabajos de GPU · modo",
+      gpuModeNote: "Qué hacer con el modelo cuando llega un trabajo de alta carga en VRAM (ComfyUI, vídeo, 3D…). Lo aplica gpu_job.sh auto.",
+      gpuModeAria: "Modo para trabajos de GPU",
+      gpuModeSaved: (label) => "Modo para trabajos de GPU: " + label,
+      gpuModeNow: "En este equipo, ahora:",
+      gpuModeAfterSmall: "Al terminar responde el modelo pequeño; el primario vuelve cuando se pide algo complejo o tras un rato sin actividad.",
+      gpuModeAfterPrimary: "Al terminar se recarga el modelo primario antes de responder.",
       serverDown: "servidor caído",
       stateText: (s) => "estado: " + s,
       engineText: (s) => "motor: " + s,
@@ -367,8 +374,15 @@
       unregisteredModel: "unregistered model",
       startingUp: "starting…",
       gpuJobUnloaded: "LLM unloaded for a GPU job",
-      gpuJobUnloadedNote: (job, min) => "Job running" + (job ? " (" + job + ")" : "") + ", " + min + " min. The primary model comes back by itself when it ends; do not swap meanwhile.",
-      gpuJobRunningNote: (job, min) => "GPU job running" + (job ? " (" + job + ")" : "") + ", " + min + " min. The primary model comes back by itself when it ends.",
+      gpuJobUnloadedNote: (job, min) => "Job running" + (job ? " (" + job + ")" : "") + ", " + min + " min. A model comes back by itself when it ends; do not swap meanwhile.",
+      gpuJobRunningNote: (job, min) => "GPU job running" + (job ? " (" + job + ")" : "") + ", " + min + " min. The loaded model keeps answering when it ends.",
+      gpuModeTitle: "GPU jobs · mode",
+      gpuModeNote: "What to do with the model when a VRAM-heavy job arrives (ComfyUI, video, 3D…). Applied by gpu_job.sh auto.",
+      gpuModeAria: "GPU job mode",
+      gpuModeSaved: (label) => "GPU job mode: " + label,
+      gpuModeNow: "On this machine, now:",
+      gpuModeAfterSmall: "When it ends the small model answers; the primary returns when something complex is asked or after some idle time.",
+      gpuModeAfterPrimary: "When it ends the primary model is reloaded before answering.",
       serverDown: "server down",
       stateText: (s) => "state: " + s,
       engineText: (s) => "engine: " + s,
@@ -972,6 +986,30 @@
       msg ? h("div", { className: msg.kind === "bad" ? "sms-error" : "sms-ok" }, msg.text) : null);
   }
 
+  // What gpu_job.sh does with the LLM while a VRAM-heavy job runs (setting
+  // gpu_job_mode). One option per mode; the backend says what the selected
+  // one means on this machine right now.
+  function GpuJobModes(props) {
+    const g = props.data || {};
+    const modes = g.modes || [];
+    return h("div", { className: "sms-col" },
+      h("div", { className: "sms-muted" }, t("gpuModeNote")),
+      h("div", { className: "sms-modes", role: "radiogroup", "aria-label": t("gpuModeAria") },
+        modes.map(function (m) {
+          const on = m.id === g.mode;
+          return h("button", {
+            key: m.id, type: "button", role: "radio", "aria-checked": on ? "true" : "false",
+            className: "sms-mode" + (on ? " on" : ""), disabled: !!props.disabled,
+            onClick: function () { if (!on) props.onPick(m); }
+          },
+            h("span", { className: "sms-mode-name" }, m.label),
+            h("span", { className: "sms-mode-desc" }, m.description));
+        })),
+      g.summary ? h("div", { className: g.layout && g.layout.degraded ? "sms-warn" : "sms-muted" },
+        t("gpuModeNow") + " " + g.summary) : null,
+      h("div", { className: "sms-muted" }, t(g.after === "primary" ? "gpuModeAfterPrimary" : "gpuModeAfterSmall")));
+  }
+
   // SmartModelProvider: the model-provider half of this plugin. It is only
   // written to disk when the user asks for it here (or with the CLI).
   function Provider(props) {
@@ -1177,6 +1215,12 @@
           h("div", { className: "sms-row sms-muted" },
             h("span", null, t("freeText", status.total_free_gb != null ? status.total_free_gb + " GB" : "?")),
             h("span", null, "ComfyUI: " + (comfy.up ? t("comfyUp") : t("comfyDown")))))),
+
+      h(Card, { title: t("gpuModeTitle") },
+        h(GpuJobModes, {
+          data: data.gpu_job_modes, disabled: !!pending,
+          onPick: function (m) { act("gpumode", "/gpu_job/mode", { mode: m.id }, t("gpuModeSaved", m.label)); }
+        })),
 
       h("div", { className: "sms-grid" },
         h(Card, { title: t("enginesTitle") },

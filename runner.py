@@ -25,15 +25,45 @@ import tools  # noqa: E402  (local plugin module)
 
 
 def _watch(name: str, log) -> None:
-    """Start the idle watcher when a non-primary model ended up serving."""
+    """Start the watcher for the model that ended up serving: idle restore for a
+    non-primary model, crash recovery (auto_recover) for any model."""
     try:
-        if not tools.same_name(name, tools.get_cfg().get("primary_model")):
-            r = tools.spawn_idle_watch(name)
-            if r.get("pid"):
-                log(f"idle watcher started (pid {r['pid']}): primary comes back after "
-                    f"{tools.get_cfg().get('idle_restore_min')} min idle")
+        cfg = tools.get_cfg()
+        r = tools.spawn_idle_watch(name)
+        if r.get("pid"):
+            what = []
+            if (not tools.same_name(name, cfg.get("primary_model"))
+                    and float(cfg.get("idle_restore_min") or 0) > 0):
+                what.append(f"primary comes back after {cfg.get('idle_restore_min')} min idle")
+            if cfg.get("auto_recover", True):
+                what.append("swaps to another model if this one dies")
+            log(f"watcher started (pid {r['pid']}): " + "; ".join(what))
     except Exception as e:  # noqa: BLE001
-        log(f"idle watcher not started: {type(e).__name__}: {e}")
+        log(f"watcher not started: {type(e).__name__}: {e}")
+
+
+def load_instead(failed: dict, prefer: list, log) -> str | None:
+    """`failed` could not be loaded: bring up another model that fits so the
+    agent keeps a brain. Returns the name now serving, or None."""
+    tools.note_failure(failed["name"], "load failed")
+    if not tools.get_cfg().get("auto_recover", True):
+        return None
+    for name in tools.recovery_candidates(failed["name"], prefer):
+        fb = tools.find_model(name)
+        rc = tools.release_check(fb)
+        if not rc["ok"]:
+            log(f"  '{name}' does not fit now: {rc['summary']}")
+            continue
+        log(f"auto-recover: loading '{name}' instead of '{failed['name']}'")
+        res = tools.start_model(fb)
+        if res.get("ok"):
+            log(f"auto-recover OK: '{name}' up in {res.get('load_s')}s")
+            return name
+        log(f"auto-recover: '{name}' FAILED too: {res.get('error')}")
+        tools.note_failure(name, "load failed")
+        tools.stop_server()
+    log("auto-recover: no other model could be loaded; the LLM stays unloaded")
+    return None
 
 
 def release_or_fallback(entry: dict, prev: str | None, log) -> dict | None:
@@ -80,19 +110,23 @@ def idle_watch(target: str) -> int:
     cfg = tools.get_cfg()
     minutes = float(cfg.get("idle_restore_min") or 0)
     primary = str(cfg.get("primary_model") or "")
-    poll = 30.0 if minutes >= 2 else 5.0
+    recover = bool(cfg.get("auto_recover", True))
+    poll = 5.0 if 0 < minutes < 2 else (15.0 if recover else 30.0)
 
     def say(msg: str) -> None:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] idle-watch: {msg}", flush=True)
 
-    if minutes <= 0:
+    if minutes <= 0 and not recover:
         return 0
     if tools.idle_watch_status():
         return 0
     tools.idle_watch_file().write_text(json.dumps(
         {"pid": os.getpid(), "target": target, "minutes": minutes,
          "started": time.strftime("%Y-%m-%dT%H:%M:%S")}))
-    say(f"restore '{primary}' after {minutes:g} min without activity on '{target}'")
+    if minutes > 0 and not tools.same_name(target, primary):
+        say(f"restore '{primary}' after {minutes:g} min without activity on '{target}'")
+    if recover:
+        say(f"watching '{target}': if it dies, another model is loaded")
     try:
         last_counter = tools.llm_activity()
         last_active = time.time()
@@ -102,10 +136,38 @@ def idle_watch(target: str) -> int:
             if tools.busy_state():
                 last_active = now
                 continue
-            current = tools.match_model(tools.llm_health(timeout=2.0))
-            if current is None or tools.same_name(current, primary):
-                say(f"{'primary is back' if current else 'no model serving'}; exiting")
-                return 0
+            health = tools.llm_health(timeout=2.0)
+            current = tools.match_model(health)
+            if current is None:
+                dead = tools.crashed_model() if recover and not health.get("up") else None
+                if not dead:
+                    say("no model serving (stopped on purpose); exiting")
+                    return 0
+                if tools.gpu_job_active():
+                    continue  # gpu_job.sh brings a model back when the job ends
+                time.sleep(3)  # a swap may have just started: look again
+                if tools.busy_state() or tools.llm_health(timeout=2.0).get("up"):
+                    continue
+                say(f"'{dead}' died on its own (see llama-{dead}.log): swapping to another model")
+                tools.note_failure(dead, "server died")
+                tools.write_state({"server": None})
+                for name in tools.recovery_candidates(dead):
+                    if tools.same_name(name, primary):
+                        out = json.loads(tools.h_restore({}))
+                    else:
+                        out = json.loads(tools.h_swap({"model": name}))
+                    if out.get("ok"):
+                        say(f"auto-recover: loading '{name}' (its runner starts the next watcher)")
+                        return 0
+                    say(f"auto-recover: '{name}' refused: {out.get('error')}")
+                say("auto-recover: no other model can be loaded; the LLM stays unloaded")
+                return 1
+            if tools.same_name(current, primary) or minutes <= 0:
+                if not recover:
+                    say("primary is back; exiting")
+                    return 0
+                last_active = now
+                continue  # nothing to restore: only watch that it stays alive
             counter = tools.llm_activity()
             working = (counter is not None and last_counter is not None and counter != last_counter)
             working = working or (tools.requests_processing() or 0) > 0
@@ -222,6 +284,10 @@ def main() -> int:
                 entry = tools.find_model(target)
                 if not entry:
                     return finish(False, {"error": f"unknown model '{target}'"}, None)
+                pin = tools.read_state().get("pin_gpu")
+                if pin is not None:
+                    entry = dict(entry, pin_gpu=int(pin))
+                    log(f"'{target}' goes whole on GPU {pin} (the other GPUs stay free)")
             else:
                 entry = primary
                 if not entry:
@@ -245,20 +311,19 @@ def main() -> int:
             for ln in res.get("log_tail") or []:
                 log("    | " + ln)
 
-            # 4) failed: clear the broken target, then bring the brain back.
-            # The result stays ok=False: the model that was asked for is NOT running.
-            if action == "swap" and primary and primary.get("name") != entry.get("name"):
-                log("restoring primary after failed swap")
-                stop()
-                res2 = tools.start_model(primary)
-                ok2 = bool(res2.get("ok"))
-                log(f"primary restore: {'OK' if ok2 else 'FAILED'} {res2}")
-                return finish(False, {"error": f"swap to '{target}' failed: {res.get('error')}",
-                                      "target_failed": res, "primary_restored": ok2,
-                                      "primary": res2},
-                              primary["name"] if ok2 else None)
+            # 4) failed: clear the broken target, then load another model so the
+            # agent keeps a brain (the one that was serving first, then the primary,
+            # then from small to big). The result stays ok=False: the model that
+            # was asked for is NOT running.
             stop()  # do not leave a half-loaded server holding VRAM
-            return finish(False, res, None)
+            now_serving = load_instead(entry, [prev] if action != "swap" else [], log)
+            rc = finish(False, {"error": f"{action} to '{entry['name']}' failed: {res.get('error')}",
+                                "target_failed": res, "fallback": now_serving,
+                                "primary_restored": bool(primary) and now_serving == primary.get("name")},
+                        now_serving)
+            if now_serving:
+                _watch(now_serving, log)
+            return rc
     except Exception as e:  # noqa: BLE001
         try:
             log(f"RUNNER EXCEPTION: {type(e).__name__}: {e}")
@@ -308,12 +373,19 @@ def autostart(log, finish) -> int:
     res = tools.start_model(entry)
     if res.get("ok"):
         log(f"OK: '{target}' up in {res.get('load_s')}s ({res.get('started_by')})")
-        return finish(True, res, target)
+        rc = finish(True, res, target)
+        _watch(target, log)
+        return rc
     log(f"START FAILED: {res.get('error')}")
     for ln in res.get("log_tail") or []:
         log("    | " + ln)
     tools.stop_server()  # do not leave a half-loaded server holding VRAM
-    return finish(False, res, None)
+    now_serving = load_instead(entry, [], log)
+    rc = finish(False, {"error": f"start of '{target}' failed: {res.get('error')}",
+                        "target_failed": res, "fallback": now_serving}, now_serving)
+    if now_serving:
+        _watch(now_serving, log)
+    return rc
 
 
 if __name__ == "__main__":

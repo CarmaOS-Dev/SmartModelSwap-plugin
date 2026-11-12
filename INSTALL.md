@@ -56,7 +56,7 @@ Each load records the VRAM the model takes per GPU (`~/.hermes/cache/smart-model
 
 ## 4. Optional
 - **SmartModelProvider as a Hermes model provider:** use **Install** in the dashboard tab or Desktop pane, or `hermes sms provider install`. Then pick it with `/model`.
-- **Bundled agent skill:** `skill_view("smart-model-swap:smart-model-routing")`. It holds the routing rules and `skills/smart-model-routing/templates/gpu_job.sh`, which runs GPU jobs with the LLM swapped out and always restores.
+- **Bundled agent skill:** `skill_view("smart-model-swap:smart-model-routing")`. It holds the routing rules and `skills/smart-model-routing/templates/gpu_job.sh`, which runs GPU jobs with the LLM swapped out and always leaves a model serving (the small one by default).
 
 ## State and logs
 Everything lives in `~/.hermes/cache/smart-model-swap/`:

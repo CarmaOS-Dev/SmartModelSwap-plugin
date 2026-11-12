@@ -67,7 +67,7 @@ CLI: `hermes sms status|plan|swap <m> [--dry-run] [--wait] [--force]|restore [--
     `gpu_holders`.
 - **Bundled skill.** The agent's big-vs-small routing rules ship with the plugin as
   `skill_view("smart-model-swap:smart-model-routing")` (`skills/smart-model-routing/`). It includes
-  `templates/gpu_job.sh`, which frees VRAM, runs a job and always restores. Plugin skills are not listed in the
+  `templates/gpu_job.sh`, which frees VRAM, runs a job and always leaves a model serving (the small one by default). Plugin skills are not listed in the
   system prompt; the tool descriptions and hints point the agent to it.
 
 ## Engines
@@ -195,8 +195,9 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
 - **VRAM settle**: after a stop we wait until VRAM stops moving before loading.
 - **Verified load**: a start only succeeds when `/health` is OK *and* the server reports the
   requested model; a process that dies during load fails immediately with its log tail.
-- **Fail-safe**: a failed swap restores the primary — and is still reported as failed
-  (`ok: false`, `primary_restored: true`).
+- **Fail-safe / auto-recover**: a model that fails to load, or whose server dies while serving, is replaced by
+  another model that fits (the primary first, then from small to big; setting `auto_recover`). A failed swap is
+  still reported as failed (`ok: false`, `fallback: <model now serving>`).
 - **State and logs:** state lives in `~/.hermes/cache/smart-model-swap/` (`state.json`, runner and per-model logs,
   cached `--help`).
 
@@ -253,6 +254,7 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
 
 `primary_model`, `autostart_primary`, `gpu_wait_s`, `isolate_scope`, `models_file`,
 `nvidia_smi`, `grace_s`, `drain_timeout_s`, `drain_max_s`, `release_wait_s`, `idle_restore_min`,
+`gpu_job_mode`, `after_gpu_job`, `auto_recover`,
 `vram_settle_mib`, `vram_settle_timeout_s`, `comfy_url`, `inject_status`, `guard_tools`,
 `block_when_unloaded`. The engine binary, host and port are now in the
 **Engines** card (`models.json` → `engines`). `llama_bin`, `base_url` and

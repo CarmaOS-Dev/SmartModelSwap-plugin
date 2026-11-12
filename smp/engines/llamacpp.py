@@ -42,6 +42,62 @@ class LlamaCppEngine(Engine):
         return ([self.binary(ecfg, entry), "-m", str(entry.get("gguf") or "")]
                 + self._endpoint_args(ecfg) + [str(a) for a in args])
 
+    _SPREAD_FLAGS = ("-ts", "--tensor-split", "-dev", "--device", "-mg", "--main-gpu")
+
+    def pin_args(self, args: list[str]) -> list[str]:
+        out, skip = [], False
+        for a in args:
+            if skip:
+                skip = False
+                continue
+            if a in self._SPREAD_FLAGS:
+                skip = True
+                continue
+            if any(a.startswith(f + "=") for f in self._SPREAD_FLAGS if f.startswith("--")):
+                continue
+            out.append(a)
+        return out
+
+    _MULTI_ONLY_SPLIT = ("tensor", "row")
+
+    def _one_device(self, ecfg: dict, entry: dict, args: list[str]) -> bool:
+        """The launch can only see or use ONE GPU (pin, --device X, or a
+        single-entry CUDA_VISIBLE_DEVICES)."""
+        if entry.get("pin_gpu") is not None:
+            return True
+        dev = None
+        for i, a in enumerate(args):
+            if a in ("-dev", "--device") and i + 1 < len(args):
+                dev = str(args[i + 1])
+            elif a.startswith("--device="):
+                dev = a.split("=", 1)[1]
+        if dev is not None:
+            return dev.strip().lower() != "none" and len([d for d in dev.split(",") if d.strip()]) == 1
+        cvd = self.env(ecfg, entry).get("CUDA_VISIBLE_DEVICES")
+        return cvd is not None and len([d for d in cvd.split(",") if d.strip()]) == 1
+
+    def finalize_args(self, ecfg: dict, entry: dict, args: list[str]) -> list[str]:
+        args = super().finalize_args(ecfg, entry, args)
+        if not self._one_device(ecfg, entry, args):
+            return args
+        # `-sm tensor|row` split the model ACROSS GPUs. On a single device
+        # llama-server loads fine and then aborts on the first decode
+        # (ggml-backend-meta: GGML_BACKEND_SPLIT_AXIS_UNKNOWN). Drop the flag:
+        # the default mode is the right one for one GPU.
+        out, i = [], 0
+        while i < len(args):
+            a = args[i]
+            if a in ("-sm", "--split-mode") and i + 1 < len(args):
+                if str(args[i + 1]).lower() in self._MULTI_ONLY_SPLIT:
+                    i += 2
+                    continue
+            elif a.startswith("--split-mode=") and a.split("=", 1)[1].lower() in self._MULTI_ONLY_SPLIT:
+                i += 1
+                continue
+            out.append(a)
+            i += 1
+        return out
+
     def gpu_split(self, ecfg: dict, entry: dict, args: list[str],
                   gpus: list[int]) -> Optional[dict]:
         """How llama.cpp spreads the model over physical GPUs, from its flags.
@@ -162,7 +218,11 @@ class LlamaCppEngine(Engine):
             if line.startswith("#"):
                 continue
             name = line.split(" ", 1)[0]
-            if name in ("llamacpp:prompt_tokens_total", "llamacpp:tokens_predicted_total"):
+            # n_decode_total moves on every decode; the two token totals only
+            # move when a request ENDS, so alone they make a long generation
+            # look stalled (and the drain would cut a reply that is progressing).
+            if name in ("llamacpp:prompt_tokens_total", "llamacpp:tokens_predicted_total",
+                        "llamacpp:n_decode_total"):
                 try:
                     total += float(line.split()[-1])
                     seen = True
