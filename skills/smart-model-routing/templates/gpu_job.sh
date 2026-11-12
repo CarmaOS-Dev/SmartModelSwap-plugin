@@ -28,12 +28,13 @@ SMALL="${1:?usage: gpu_job.sh <auto|none|nano|multi|keep|model> -- <command...>}
 [ $# -gt 0 ] || { echo "usage: gpu_job.sh <auto|none|nano|multi|keep|model> -- <command...>" >&2; exit 2; }
 
 HERMES="${HERMES_BIN:-hermes}"
-LOG="${GPU_JOB_LOG:-$HOME/.hermes/cache/smart-model-swap/gpu_job_$(date +%Y%m%d_%H%M%S).log}"
+SMS_CACHE="${HERMES_HOME:-$HOME/.hermes}/cache/smart-model-swap"   # follows the active profile
+LOG="${GPU_JOB_LOG:-$SMS_CACHE/gpu_job_$(date +%Y%m%d_%H%M%S).log}"
 mkdir -p "$(dirname "$LOG")"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
 # Marker: while it exists with our PID, SMP's idle watcher will not restore the primary mid-job.
-MARK="$HOME/.hermes/cache/smart-model-swap/gpu_job.active"
+MARK="$SMS_CACHE/gpu_job.active"
 echo $$ > "$MARK"
 
 restored=0

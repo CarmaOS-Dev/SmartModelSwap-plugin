@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Catalog review**
+- **Minimal environment for the engine and `nvidia-smi`.** They no longer inherit the Hermes process environment (provider API keys included): only `PATH`, `HOME`, `LANG`/`LC_*`, `LD_LIBRARY_PATH`, `TMPDIR`, `USER`/`LOGNAME`, `CUDA_*`, `GGML_*`, the user-bus variables `systemd-run --user --scope` needs (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`), plus the `env` overrides of the engine and the model in `models.json`. A model that needs another variable (e.g. `HF_TOKEN`) declares it there.
+- **Active profile.** State, logs and the provider install resolve the home through `hermes_constants.get_hermes_home()`; the detached runner and `gpu_job.sh` follow the same home (`HERMES_HOME`).
+- Gateway detection uses `gateway.status.looks_like_gateway_command_line`; the dashboard no longer injects its stylesheet (the host loads the manifest css); settings are written with `ctx.set_config` when the plugin context exists in the process.
+
+**Features and fixes**
 - **Fast reply after a GPU job.** `gpu_job.sh` no longer reloads the primary when the job ends: the small model (already loaded, or the smallest that fits after `none`) delivers the result. The primary returns on demand (`sms_restore`) or through the idle restore. New setting `after_gpu_job` (`small` default, `primary` = old behaviour) and CLI `hermes sms after-job`.
 - **`gpu_job.sh auto`.** Machine-aware placement: with 2+ GPUs the small model is loaded whole on one GPU (`hermes sms swap <model> --gpu N`, `sms_swap(gpu=N)`) and the job gets another GPU (`$SMS_TASK_GPU`), so no reload is needed when it ends; with one GPU the LLM is unloaded during the job. New CLI `hermes sms job-layout`; `sms_plan` returns it as `gpu_job_auto`. Pinned layouts get their own VRAM profile.
 - **GPU job mode selector** in the dashboard and Desktop (setting `gpu_job_mode`): **Auto** (best for the machine), **None** (unload the LLM), **Nano** (keep the small model), **Multi** (small model on one GPU, another GPU for the job) and **Keep** (leave the loaded model alone). `gpu_job.sh auto` applies the selected mode; a mode that is not possible degrades to None and says why. API: `GET /state` → `gpu_job_modes`, `POST /gpu_job/mode`; CLI: `hermes sms job-layout --mode`.

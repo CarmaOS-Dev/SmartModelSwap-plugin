@@ -22,6 +22,27 @@ from typing import Optional
 from ..i18n import t
 
 
+# What an engine binary or nvidia-smi may inherit from the Hermes process. The
+# host environment carries every provider API key; none of them is the engine's
+# business. Anything else a model needs goes in the `env` of its engine or of
+# the model itself (models.json), which is applied on top.
+_ENV_KEEP = ("PATH", "HOME", "LANG", "LANGUAGE", "LD_LIBRARY_PATH", "TMPDIR", "USER", "LOGNAME",
+             # the launch is wrapped in `systemd-run --user --scope`, which needs the user bus
+             "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+_ENV_KEEP_PREFIXES = ("LC_", "CUDA_", "GGML_")
+
+
+def minimal_env(*overrides) -> dict:
+    """Allow-listed copy of os.environ plus the given {name: value} overrides."""
+    env = {k: v for k, v in os.environ.items()
+           if k in _ENV_KEEP or k.startswith(_ENV_KEEP_PREFIXES)}
+    env.setdefault("LD_LIBRARY_PATH", "/usr/lib/wsl/lib")
+    for src in overrides:
+        if isinstance(src, dict):
+            env.update({str(k): str(v) for k, v in src.items()})
+    return env
+
+
 class EngineUnavailable(RuntimeError):
     """The engine cannot launch models (not configured, or under construction)."""
 
@@ -88,11 +109,7 @@ class Engine:
         return bool(b) and os.path.isfile(b) and os.access(b, os.X_OK)
 
     def env(self, ecfg: dict, entry: Optional[dict] = None) -> dict:
-        env = dict(os.environ)
-        env.setdefault("LD_LIBRARY_PATH", "/usr/lib/wsl/lib")
-        for src in (self.normalize(ecfg).get("env") or {}, (entry or {}).get("env") or {}):
-            if isinstance(src, dict):
-                env.update({str(k): str(v) for k, v in src.items()})
+        env = minimal_env(self.normalize(ecfg).get("env") or {}, (entry or {}).get("env") or {})
         pin = (entry or {}).get("pin_gpu")
         if pin is not None:  # one physical GPU, numbered like nvidia-smi
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"

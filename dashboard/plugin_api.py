@@ -127,11 +127,11 @@ def _schema_type(key: str) -> Optional[str]:
 def set_setting(key: str, value: Any) -> dict:
     """Write one plugin setting (`plugins.entries.<id>.settings.<key>`).
 
-    Public surface only (catalog rule 9): `hermes_cli.config.save_config` with
-    `merge_existing=True` merges this one key into the on-disk config under the
-    config lock, like `hermes config set`. `ctx.set_config` would be the plugin
-    API, but this module is imported by the dashboard process, which may never
-    run `register(ctx)`, so there is no context to use here.
+    Public surface only (catalog rule 9). `ctx.set_config` is the plugin API and
+    is used whenever `register(ctx)` ran in this process. The dashboard process
+    may import this module without ever registering the plugin; then there is no
+    context, and `hermes_cli.config.save_config(merge_existing=True)` merges the
+    one key into the on-disk config under the config lock, like `hermes config set`.
     """
     kind = _schema_type(key)
     if key not in tools.DEFAULTS or kind is None:
@@ -144,12 +144,18 @@ def set_setting(key: str, value: Any) -> dict:
         if is_managed():
             return {"ok": False, "error": t("instalación gestionada: los ajustes no se pueden cambiar",
                                             "managed install: settings cannot be changed")}
-        save_config({"plugins": {"entries": {PLUGIN_ID: {"settings": {key: value}}}}}, merge_existing=True)
+        ctx = getattr(tools, "PLUGIN_CTX", None)
+        via = "ctx"
+        if ctx is not None and hasattr(ctx, "set_config"):
+            ctx.set_config(key, value)
+        else:
+            via = "config"
+            save_config({"plugins": {"entries": {PLUGIN_ID: {"settings": {key: value}}}}}, merge_existing=True)
         entry = (((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}).get(PLUGIN_ID) or {}
         if (entry.get("settings") or {}).get(key) != value:
             return {"ok": False, "error": t(f"no se pudo guardar '{key}' (¿clave administrada?)",
                                             f"could not save '{key}' (administrator-managed key?)")}
-        return {"ok": True, "via": "config", "written": [key]}
+        return {"ok": True, "via": via, "written": [key]}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 

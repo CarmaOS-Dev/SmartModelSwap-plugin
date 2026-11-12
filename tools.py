@@ -73,6 +73,7 @@ RUNNER_SCOPE_PREFIX = "sms-runner-"
 LLM_SCOPE_PREFIX = "sms-llm-"
 
 _CFG: dict = dict(DEFAULTS)
+PLUGIN_CTX = None  # the PluginContext, when register(ctx) ran in this process
 
 
 def _as_bool(v) -> bool:
@@ -101,7 +102,20 @@ def get_cfg() -> dict:
 # ---------------------------------------------------------------- paths/state
 
 def hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    """The active profile's Hermes home, so state, logs and the provider install
+    follow it. The detached runner is a plain script without Hermes on its path:
+    it gets the resolved home through HERMES_HOME (see child_env)."""
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except ImportError:
+        return Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
+
+
+def child_env() -> dict:
+    """Environment for our own detached runner / watcher: the parent's, with the
+    resolved Hermes home pinned so both sides agree on where the state lives."""
+    return dict(os.environ, HERMES_HOME=str(hermes_home()))
 
 
 def cache_dir() -> Path:
@@ -875,9 +889,8 @@ def nvidia_smi_path() -> str | None:
 
 
 def nvidia_env() -> dict:
-    env = dict(os.environ)
-    env.setdefault("LD_LIBRARY_PATH", "/usr/lib/wsl/lib")
-    return env
+    """Minimal environment for nvidia-smi (no provider keys from the host process)."""
+    return smp_engines.minimal_env()
 
 
 def get_vram() -> list[dict]:
@@ -1169,7 +1182,7 @@ def spawn_idle_watch(target: str) -> dict:
         RUNNER_SCOPE_PREFIX, "idle")
     with open(log_file(), "ab") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                start_new_session=True, cwd=str(PLUGIN_DIR))
+                                start_new_session=True, cwd=str(PLUGIN_DIR), env=child_env())
     return {"ok": True, "pid": proc.pid, "scope": scope, "target": target}
 
 
@@ -1783,7 +1796,7 @@ def spawn_runner(action: str, target: str, grace: int | None = None, pin=None) -
         lf.flush()
         proc = subprocess.Popen(
             cmd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            start_new_session=True, cwd=str(PLUGIN_DIR),
+            start_new_session=True, cwd=str(PLUGIN_DIR), env=child_env(),
         )
     write_state({"runner_pid": proc.pid})
     note = ("Loading in the background." if action == "start" else

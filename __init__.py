@@ -30,8 +30,13 @@ def _status_context(**kwargs):
 
 def _is_gateway_process() -> bool:
     """`hermes gateway run` (the long-lived gateway), not the CLI or `hermes serve`."""
-    argv = [a.lower() for a in sys.argv[1:]]
-    return "gateway" in argv and "run" in argv
+    try:
+        from gateway.status import looks_like_gateway_command_line
+        # the real command line (sys.argv[0] is rewritten by the launcher)
+        return looks_like_gateway_command_line(" ".join(sys.orig_argv))
+    except (ImportError, AttributeError):  # older host
+        argv = [a.lower() for a in sys.argv[1:]]
+        return "gateway" in argv and "run" in argv
 
 
 def register(ctx) -> None:
@@ -46,6 +51,7 @@ def register(ctx) -> None:
         if val not in (None, ""):
             resolved[key] = val
     tools.apply_cfg(resolved)
+    tools.PLUGIN_CTX = ctx  # the dashboard backend writes settings through it when loaded here
 
     # SmartModelProvider (the model-provider half): keep an INSTALLED copy in
     # step with the registry. Installing it is the user's call (UI / CLI).

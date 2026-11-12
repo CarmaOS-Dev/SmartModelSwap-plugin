@@ -422,20 +422,6 @@
   function langOf(loc) { return /^es([-_]|$)/i.test(String(loc || '')) ? 'es' : 'en'; }
   function t(key, ...args) { const d = I18N[LANG] || I18N.es; let v = d[key]; if (v === undefined) v = I18N.es[key]; if (v === undefined) return key; return typeof v === 'function' ? v(...args) : v; }
 
-  // The host loads manifest.css, but a dashboard that cached the plugin list
-  // before the stylesheet existed does not know about it yet: load it ourselves.
-  (function ensureCss() {
-    const href = "/dashboard-plugins/smart-model-swap/dist/style.css";
-    const links = document.querySelectorAll('link[rel="stylesheet"]');
-    for (let i = 0; i < links.length; i++) {
-      if ((links[i].getAttribute("href") || "").indexOf("smart-model-swap/dist/style.css") >= 0) return;
-    }
-    const link = document.createElement("link");
-    link.rel = "stylesheet";
-    link.href = href;
-    document.head.appendChild(link);
-  })();
-
   // Host primitives when present, plain elements otherwise (older hosts).
   function Card(props) {
     if (!C.Card) return h("section", { className: "sms-item sms-col", style: { alignItems: "stretch" } }, h("strong", null, props.title), props.children);

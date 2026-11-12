@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .base import Engine, EngineUnavailable
+from .base import Engine, EngineUnavailable, minimal_env
 from .llamacpp import LlamaCppEngine
 from .wip import LmStudioEngine, OllamaEngine, VllmEngine
 
