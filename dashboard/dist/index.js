@@ -181,8 +181,21 @@
       gpuModeAria: "Modo para trabajos de GPU",
       gpuModeSaved: (label) => "Modo para trabajos de GPU: " + label,
       gpuModeNow: "En este equipo, ahora:",
-      gpuModeAfterSmall: "Al terminar responde el modelo pequeño; el primario vuelve cuando se pide algo complejo o tras un rato sin actividad.",
-      gpuModeAfterPrimary: "Al terminar se recarga el modelo primario antes de responder.",
+      settingsTitle: "Automatización",
+      setAfterJob: "Tras un trabajo de GPU responde",
+      setAfterJobHint: "El pequeño responde enseguida; el primario tarda en recargar.",
+      setAfterSmall: "Modelo pequeño",
+      setAfterPrimary: "Primario",
+      setIdle: "Volver al primario tras inactividad",
+      setIdleHint: "Minutos sin actividad en el modelo pequeño. 0 lo desactiva. Se aplica desde el próximo cambio de modelo.",
+      setIdleUnit: "min",
+      setRecover: "Recuperación automática",
+      setRecoverHint: "Si un modelo falla al cargar o se cae, se carga otro que quepa.",
+      setAutostart: "Cargar el primario al iniciar el gateway",
+      setAutostartHint: "Al arrancar Hermes siempre se carga el modelo primario, aunque haya quedado otro sirviendo.",
+      setSaved: "Ajuste guardado.",
+      setIdleBad: "Escribe un número entero entre 0 y 720.",
+      on: "activado", off: "desactivado",
       serverDown: "servidor caído",
       stateText: (s) => "estado: " + s,
       engineText: (s) => "motor: " + s,
@@ -381,8 +394,21 @@
       gpuModeAria: "GPU job mode",
       gpuModeSaved: (label) => "GPU job mode: " + label,
       gpuModeNow: "On this machine, now:",
-      gpuModeAfterSmall: "When it ends the small model answers; the primary returns when something complex is asked or after some idle time.",
-      gpuModeAfterPrimary: "When it ends the primary model is reloaded before answering.",
+      settingsTitle: "Automation",
+      setAfterJob: "After a GPU job, answer with",
+      setAfterJobHint: "The small one answers right away; the primary takes time to reload.",
+      setAfterSmall: "Small model",
+      setAfterPrimary: "Primary",
+      setIdle: "Back to the primary when idle",
+      setIdleHint: "Idle minutes on the small model. 0 disables it. Applies from the next model change.",
+      setIdleUnit: "min",
+      setRecover: "Auto-recover",
+      setRecoverHint: "If a model fails to load or dies, another one that fits is loaded.",
+      setAutostart: "Load the primary when the gateway starts",
+      setAutostartHint: "When Hermes starts the primary model is always loaded, even if another one was left serving.",
+      setSaved: "Setting saved.",
+      setIdleBad: "Enter a whole number between 0 and 720.",
+      on: "on", off: "off",
       serverDown: "server down",
       stateText: (s) => "state: " + s,
       engineText: (s) => "engine: " + s,
@@ -992,8 +1018,66 @@
             h("span", { className: "sms-mode-desc" }, m.description));
         })),
       g.summary ? h("div", { className: g.layout && g.layout.degraded ? "sms-warn" : "sms-muted" },
-        t("gpuModeNow") + " " + g.summary) : null,
-      h("div", { className: "sms-muted" }, t(g.after === "primary" ? "gpuModeAfterPrimary" : "gpuModeAfterSmall")));
+        t("gpuModeNow") + " " + g.summary) : null);
+  }
+
+  // Behaviour settings (the same set the Desktop pane shows): one row each,
+  // saved on change through POST /settings.
+  function SetRow(props) {
+    return h("div", { className: "sms-set" },
+      h("div", { className: "sms-set-text" },
+        h("span", { className: "sms-set-label", id: props.id }, props.label),
+        props.hint ? h("span", { className: "sms-muted" }, props.hint) : null),
+      h("div", { className: "sms-set-control" }, props.children));
+  }
+  function Toggle(props) {
+    return h("button", {
+      type: "button", role: "switch", className: "sms-switch sms-switch-sm",
+      "aria-checked": props.value ? "true" : "false", "aria-labelledby": props.labelId,
+      title: props.value ? t("on") : t("off"), disabled: !!props.disabled,
+      onClick: function () { props.onChange(!props.value); }
+    }, h("span", null));
+  }
+  function Settings(props) {
+    const s = props.settings || {};
+    const [idle, setIdle] = useState(null); // text being edited, null = show the saved value
+    const idleText = idle == null ? String(s.idle_restore_min == null ? "" : s.idle_restore_min) : idle;
+    const idleNum = /^\d+$/.test(idleText.trim()) ? parseInt(idleText, 10) : NaN;
+    const idleBad = idle != null && !(idleNum >= 0 && idleNum <= 720);
+    function save(key, value) { return props.onSave(key, value); }
+    function commitIdle() {
+      if (idle == null) return;
+      if (idleBad) return;
+      if (idleNum === s.idle_restore_min) { setIdle(null); return; }
+      Promise.resolve(save("idle_restore_min", idleNum)).then(function () { setIdle(null); });
+    }
+    return h("div", { className: "sms-col" },
+      h(SetRow, { id: "sms-set-after", label: t("setAfterJob"), hint: t("setAfterJobHint") },
+        h("div", { className: "sms-seg", role: "radiogroup", "aria-labelledby": "sms-set-after" },
+          [["small", t("setAfterSmall")], ["primary", t("setAfterPrimary")]].map(function (o) {
+            const on = s.after_gpu_job === o[0];
+            return h("button", {
+              key: o[0], type: "button", role: "radio", "aria-checked": on ? "true" : "false",
+              className: on ? "on" : "", disabled: !!props.disabled,
+              onClick: function () { if (!on) save("after_gpu_job", o[0]); }
+            }, o[1]);
+          }))),
+      h(SetRow, { id: "sms-set-idle", label: t("setIdle"), hint: idleBad ? null : t("setIdleHint") },
+        h("input", {
+          className: "sms-input sms-num" + (idleBad ? " bad" : ""), inputMode: "numeric", value: idleText,
+          "aria-labelledby": "sms-set-idle", disabled: !!props.disabled,
+          onChange: function (e) { setIdle(e.target.value); },
+          onBlur: commitIdle,
+          onKeyDown: function (e) { if (e.key === "Enter") commitIdle(); if (e.key === "Escape") setIdle(null); }
+        }),
+        h("span", { className: "sms-muted" }, t("setIdleUnit"))),
+      idleBad ? h("div", { className: "sms-error" }, t("setIdleBad")) : null,
+      h(SetRow, { id: "sms-set-recover", label: t("setRecover"), hint: t("setRecoverHint") },
+        h(Toggle, { labelId: "sms-set-recover", value: !!s.auto_recover, disabled: props.disabled,
+          onChange: function (v) { save("auto_recover", v); } })),
+      h(SetRow, { id: "sms-set-autostart", label: t("setAutostart"), hint: t("setAutostartHint") },
+        h(Toggle, { labelId: "sms-set-autostart", value: !!s.autostart_primary, disabled: props.disabled,
+          onChange: function (v) { save("autostart_primary", v); } })));
   }
 
   // SmartModelProvider: the model-provider half of this plugin. It is only
@@ -1206,6 +1290,12 @@
         h(GpuJobModes, {
           data: data.gpu_job_modes, disabled: !!pending,
           onPick: function (m) { act("gpumode", "/gpu_job/mode", { mode: m.id }, t("gpuModeSaved", m.label)); }
+        })),
+
+      h(Card, { title: t("settingsTitle") },
+        h(Settings, {
+          settings: data.settings, disabled: !!pending,
+          onSave: function (key, value) { return act("setting", "/settings", { key: key, value: value }, t("setSaved")); }
         })),
 
       h("div", { className: "sms-grid" },

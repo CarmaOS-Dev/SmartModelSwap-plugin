@@ -1806,13 +1806,21 @@ def spawn_runner(action: str, target: str, grace: int | None = None, pin=None) -
             "target": target, "runner_pid": proc.pid, "runner_scope": scope, "note": note}
 
 
-def autostart_primary() -> dict:
-    """Load the primary model when nothing is serving (gateway start-up).
+def autostart_primary(replace: bool = False) -> dict:
+    """Load the primary model (gateway start-up).
 
-    Replaces the old llama-server systemd unit: no-op when disabled, when a
-    server (ours, external or foreign) already holds the port, or when a swap
-    is in flight. Non-blocking: the runner waits for the GPU and the model
-    file (gpu_wait_s) and loads it in the background.
+    Replaces the old llama-server systemd unit: no-op when disabled, when the
+    primary is already serving, or when a swap is in flight. Non-blocking:
+    the runner waits for the GPU and the model file (gpu_wait_s) and loads it
+    in the background.
+
+    replace=True (the gateway): start-up always ends on the primary, so a
+    registered non-primary model left serving (e.g. across a gateway restart)
+    is swapped for it through a normal restore (grace + drain + release gate,
+    falling back to what was serving). Left alone: a running GPU job or
+    ComfyUI (the idle watcher restores later), a server that is still
+    loading, and anything on the port that is not a registered model.
+    replace=False (`hermes sms start`): only when nothing is serving.
     """
     cfg = get_cfg()
     if not cfg.get("autostart_primary", True):
@@ -1831,10 +1839,21 @@ def autostart_primary() -> dict:
         if busy_state():
             return {"ok": True, "skipped": f"busy ({busy_state()})"}
         servers = detect_servers(data)
-        if servers:
-            return {"ok": True, "skipped": "already running: "
-                    + "; ".join(describe_server(s) for s in servers)}
-        return spawn_runner("start", name, grace=0)
+        if not servers:
+            return spawn_runner("start", name, grace=0)
+    running = "; ".join(describe_server(s) for s in servers)
+    current = match_model(llm_health(timeout=2.0))
+    if not replace or not current or same_name(current, name):
+        return {"ok": True, "skipped": "already running: " + running}
+    if gpu_job_active() or any(h.get("kind") == "comfyui" for h in gpu_holders()):
+        return {"ok": True, "skipped": f"'{current}' is serving and a GPU job / ComfyUI is running: "
+                                       "the primary comes back through the idle restore"}
+    out = json.loads(h_restore({}))  # takes the swap lock itself
+    if out.get("ok"):
+        out["note"] = f"'{current}' was serving at start-up -> restoring the primary '{name}'"
+    else:
+        out["note"] = f"'{current}' stays: restore of '{name}' refused: {out.get('error')}"
+    return out
 
 
 # ----------------------------------------------------------------- handlers

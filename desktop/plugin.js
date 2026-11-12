@@ -192,10 +192,28 @@ const I18N = {
     gpuJobShort: 'trabajo de GPU',
     gpuJobUnloadedNote: (job, min) => `Trabajo en curso${job ? ` (${job})` : ''}, ${min} min. Al terminar vuelve un modelo solo; no hagas swap mientras tanto.`,
     gpuJobRunningNote: (job, min) => `Trabajo de GPU en curso${job ? ` (${job})` : ''}, ${min} min. Al terminar sigue respondiendo el modelo cargado.`,
-    gpuModeTitle: 'Trabajos de GPU · modo',
+    settingsHeader: 'Ajustes',
+    gpuModeTitle: 'Durante un trabajo de GPU',
     gpuModeTip: 'Qué hacer con el modelo cuando llega un trabajo de alta carga en VRAM (ComfyUI, vídeo, 3D…). Lo aplica gpu_job.sh auto.',
     gpuModeSaved: label => `Modo para trabajos de GPU: ${label}`,
-    gpuModeNow: 'Ahora:',
+    gpuModeNow: 'En este equipo, ahora:',
+    automationTitle: 'Automatización',
+    setAfterJob: 'Tras el trabajo responde',
+    setAfterJobHint: 'El pequeño responde enseguida; el primario tarda en recargar.',
+    setAfterSmall: 'Pequeño',
+    setAfterPrimary: 'Primario',
+    setIdle: 'Volver al primario tras inactividad',
+    setIdleHint: 'Minutos sin actividad; 0 lo desactiva. Desde el próximo cambio de modelo.',
+    setIdleUnit: 'min',
+    setIdleBad: 'Número entero entre 0 y 720.',
+    setRecover: 'Recuperación automática',
+    setRecoverHint: 'Si un modelo falla al cargar o se cae, se carga otro que quepa.',
+    setAutostart: 'Cargar el primario al iniciar',
+    setAutostartHint: 'Al arrancar el gateway siempre se carga el primario, aunque haya quedado otro sirviendo.',
+    setSaved: 'Ajuste guardado.',
+    on: 'activado',
+    off: 'desactivado',
+    vramOf: (used, total) => `${used} / ${total}`,
     // registration
     restUnavailable: 'ctx.rest no disponible en esta version del SDK'
   },
@@ -360,10 +378,28 @@ const I18N = {
     gpuJobShort: 'GPU job',
     gpuJobUnloadedNote: (job, min) => `Job running${job ? ` (${job})` : ''}, ${min} min. A model comes back by itself when it ends; do not swap meanwhile.`,
     gpuJobRunningNote: (job, min) => `GPU job running${job ? ` (${job})` : ''}, ${min} min. The loaded model keeps answering when it ends.`,
-    gpuModeTitle: 'GPU jobs · mode',
+    settingsHeader: 'Settings',
+    gpuModeTitle: 'During a GPU job',
     gpuModeTip: 'What to do with the model when a VRAM-heavy job arrives (ComfyUI, video, 3D…). Applied by gpu_job.sh auto.',
     gpuModeSaved: label => `GPU job mode: ${label}`,
-    gpuModeNow: 'Now:',
+    gpuModeNow: 'On this machine, now:',
+    automationTitle: 'Automation',
+    setAfterJob: 'After the job, answer with',
+    setAfterJobHint: 'The small one answers right away; the primary takes time to reload.',
+    setAfterSmall: 'Small',
+    setAfterPrimary: 'Primary',
+    setIdle: 'Back to the primary when idle',
+    setIdleHint: 'Idle minutes; 0 disables it. From the next model change.',
+    setIdleUnit: 'min',
+    setIdleBad: 'Whole number between 0 and 720.',
+    setRecover: 'Auto-recover',
+    setRecoverHint: 'If a model fails to load or dies, another one that fits is loaded.',
+    setAutostart: 'Load the primary at start-up',
+    setAutostartHint: 'When the gateway starts the primary is always loaded, even if another model was left serving.',
+    setSaved: 'Setting saved.',
+    on: 'on',
+    off: 'off',
+    vramOf: (used, total) => `${used} / ${total}`,
     // registration
     restUnavailable: 'ctx.rest is not available in this SDK version'
   }
@@ -443,6 +479,12 @@ function h(type, props, ...children) {
   if (kids.length > 1) return jsxs(type, { ...rest, children: kids }, key)
   return jsx(type, kids.length ? { ...rest, children: kids[0] } : rest, key)
 }
+
+// The Desktop app ships precompiled CSS: a Tailwind class the app itself never
+// uses does nothing in a plugin. Anything outside its set goes inline.
+const WARN = { color: 'var(--ui-warning, #d29922)' }
+const BAD_BORDER = { borderColor: 'var(--dt-destructive, #e5484d)' }
+const RULE = '1px solid var(--ui-stroke-secondary)'
 
 const LABEL = 'text-[10px] text-(--ui-text-tertiary)'
 const MONO = 'font-mono text-[11px]'
@@ -530,7 +572,7 @@ function EngineRow({ e, health, onCall, flash }) {
       h(StatusDot, { tone: up ? 'good' : wip ? 'muted' : 'bad', className: 'size-2' }),
       h('span', { className: 'min-w-0 flex-1 truncate font-medium' }, e.label),
       wip
-        ? h(Badge, { variant: 'muted', className: 'px-1 text-[10px] text-(--ui-warning,#d29922)' }, t('underConstruction'))
+        ? h(Badge, { variant: 'muted', style: WARN, className: 'px-1 text-[10px]' }, t('underConstruction'))
         : e.active
           ? h(Badge, { variant: 'muted', className: 'px-1 text-[10px]' }, t('activeBadge'))
           : h(
@@ -780,7 +822,10 @@ function ModelEditor({ name, engines, primary, models, rest, onCall, onClose, on
 
   return h(
     'div',
-    { className: 'flex flex-col gap-1.5 rounded-[4px] border border-(--ui-accent)/60 p-2 text-xs' },
+    {
+      className: 'flex flex-col gap-1.5 rounded-[4px] border p-2 text-xs',
+      style: { borderColor: 'color-mix(in srgb, var(--ui-accent) 60%, transparent)' }
+    },
     h(
       'div',
       { className: 'flex items-center gap-1.5' },
@@ -864,7 +909,7 @@ function ModelEditor({ name, engines, primary, models, rest, onCall, onClose, on
       { className: 'flex max-h-72 flex-col gap-1 overflow-y-auto' },
       rows.length === 0 ? h('div', { className: LABEL }, t('noOwnParams')) : null,
       h('div', { className: LABEL }, t('ctxSharedHint')),
-      ctxEffect ? h('div', { className: 'text-[10px] text-(--ui-warning,#d29922)' }, ctxEffect) : null,
+      ctxEffect ? h('div', { style: WARN, className: 'text-[10px]' }, ctxEffect) : null,
       rows.map(r => {
         const info = byPrefix[r.key]
         const bad = pv && (pv.unsupported || []).includes(r.key)
@@ -887,7 +932,8 @@ function ModelEditor({ name, engines, primary, models, rest, onCall, onClose, on
           'div',
           { key: r.id, className: 'flex items-center gap-1', title: info ? `${info.name} — ${info.description || ''}` : '' },
           h('input', {
-            className: cn(FIELD, MONO, 'w-[38%] shrink-0', bad && 'border-destructive'),
+            className: cn(FIELD, MONO, 'shrink-0'),
+            style: { width: '38%', ...(bad ? BAD_BORDER : null) },
             value: r.key,
             onChange: e => setRow(r.id, { key: e.target.value })
           }),
@@ -907,7 +953,8 @@ function ModelEditor({ name, engines, primary, models, rest, onCall, onClose, on
       'div',
       { className: 'flex items-center gap-1' },
       h('input', {
-        className: cn(FIELD, MONO, 'w-[38%] shrink-0'),
+        className: cn(FIELD, MONO, 'shrink-0'),
+        style: { width: '38%' },
         placeholder: '--flag',
         value: manual.key,
         onChange: e => setManual({ ...manual, key: e.target.value })
@@ -992,12 +1039,12 @@ function ModelEditor({ name, engines, primary, models, rest, onCall, onClose, on
             )
           ),
           (pv.unsupported || []).length
-            ? h('div', { className: 'text-[10px] text-(--ui-warning,#d29922)' }, t('unrecognized', pv.unsupported.join(', ')))
+            ? h('div', { style: WARN, className: 'text-[10px]' }, t('unrecognized', pv.unsupported.join(', ')))
             : null,
           (pv.fix_notes || []).length
             ? h(
                 'div',
-                { className: 'flex flex-col gap-1 text-[10px] text-(--ui-warning,#d29922)' },
+                { style: WARN, className: 'flex flex-col gap-1 text-[10px]' },
                 t('suggestions', pv.fix_notes.join(' · ')),
                 pv.fixed_rows
                   ? h('div', null, h(Button, { variant: 'outline', size: 'sm', onClick: () => setRows(withIds(pv.fixed_rows)) }, t('apply')))
@@ -1191,7 +1238,8 @@ function ParamsEditor({ models, specs, current, primary, onCall }) {
                             setEdit({ key, vals: { ...vals, [sp.key]: e.target.value } })
                             setNote(null)
                           },
-                          className: cn(FIELD, 'font-mono text-[11px]', err && 'border-destructive')
+                          className: cn(FIELD, 'font-mono text-[11px]'),
+                          style: err ? BAD_BORDER : undefined
                         }),
                         err ? jsx('span', { className: 'text-[10px] text-destructive', children: err }) : null
                       ]
@@ -1294,6 +1342,210 @@ function ParamsEditor({ models, specs, current, primary, onCall }) {
 
 // The model-provider half of this plugin. Only written to disk when the user
 // asks for it here (or with `hermes sms provider install`).
+// --------------------------------------------------------------------------- settings
+
+const SECTION = 'text-[11px] font-medium uppercase tracking-wide text-(--ui-text-tertiary)'
+const CARD = 'rounded-[4px] border border-(--ui-stroke-secondary)'
+const HINT = 'text-[10px] leading-snug text-(--ui-text-tertiary)'
+
+// One setting: what it is (and a one-line hint) on the left, its control on the right.
+function SettingRow({ id, label, hint, error, children }) {
+  return h(
+    'div',
+    { className: 'flex items-start gap-2 px-2 py-1.5', style: { borderTop: RULE } },
+    h(
+      'div',
+      { className: 'flex min-w-0 flex-1 flex-col gap-0.5' },
+      h('span', { id, className: 'text-xs' }, label),
+      error ? h('span', { className: 'text-[10px] leading-snug text-destructive' }, error) : hint ? h('span', { className: HINT }, hint) : null
+    ),
+    h('div', { className: 'flex shrink-0 items-center gap-1', style: { paddingTop: 1 } }, children)
+  )
+}
+
+function Toggle({ value, onChange, disabled, labelId }) {
+  return jsx('button', {
+    type: 'button',
+    role: 'switch',
+    'aria-checked': value ? 'true' : 'false',
+    'aria-labelledby': labelId,
+    title: value ? t('on') : t('off'),
+    disabled,
+    onClick: () => onChange(!value),
+    className: cn(
+      'relative w-8 shrink-0 rounded-full border transition-colors',
+      value ? 'border-(--ui-accent) bg-(--ui-accent)' : 'border-(--ui-stroke-secondary) bg-transparent',
+      disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+    ),
+    style: { height: 18 },
+    children: jsx('span', {
+      className: cn('absolute size-3 rounded-full transition-transform', value ? 'bg-background' : 'bg-(--ui-text-tertiary)'),
+      style: { left: 2, top: 2, transform: value ? 'translateX(14px)' : 'none' }
+    })
+  })
+}
+
+function Segmented({ value, options, onChange, disabled, labelId }) {
+  return jsx('div', {
+    role: 'radiogroup',
+    'aria-labelledby': labelId,
+    className: 'inline-flex overflow-hidden rounded-[3px] border border-(--ui-stroke-secondary)',
+    children: options.map(([id, label], i) =>
+      jsx(
+        'button',
+        {
+          type: 'button',
+          role: 'radio',
+          'aria-checked': id === value ? 'true' : 'false',
+          disabled,
+          onClick: () => (id === value ? null : onChange(id)),
+          className: cn(
+            'px-1.5 py-0.5 text-[11px] transition-colors',
+            i ? 'border-l border-(--ui-stroke-secondary)' : '',
+            id === value
+              ? 'bg-(--ui-accent) text-background'
+              : 'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground',
+            disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+          ),
+          children: label
+        },
+        id
+      )
+    )
+  })
+}
+
+// What gpu_job.sh does with the LLM during a VRAM-heavy job: one option per
+// line; the selected one opens to show what it does and what it means on this
+// machine right now.
+function GpuModePicker({ gpuModes, disabled, onPick }) {
+  const list = gpuModes.modes || []
+  const degraded = !!(gpuModes.layout && gpuModes.layout.degraded)
+  return h(
+    'div',
+    { className: cn(CARD, 'flex flex-col') },
+    jsx(Tip, {
+      label: t('gpuModeTip'),
+      children: h('span', { id: 'sms-gpu-mode', className: 'w-fit px-2 pt-1.5 text-[10px] font-medium text-(--ui-text-tertiary)' }, t('gpuModeTitle'))
+    }),
+    h(
+      'div',
+      { role: 'radiogroup', 'aria-labelledby': 'sms-gpu-mode', className: 'flex flex-col p-1' },
+      list.map(m => {
+        const on = m.id === gpuModes.mode
+        return h(
+          'button',
+          {
+            key: m.id,
+            type: 'button',
+            role: 'radio',
+            'aria-checked': on ? 'true' : 'false',
+            title: on ? undefined : m.description,
+            disabled,
+            onClick: () => (on ? null : onPick(m)),
+            className: cn(
+              'flex items-start gap-2 rounded-[3px] px-1.5 py-1 text-left transition-colors',
+              on ? 'bg-(--chrome-action-hover)' : 'hover:bg-(--chrome-action-hover)',
+              disabled ? 'cursor-not-allowed opacity-60' : on ? 'cursor-default' : 'cursor-pointer'
+            )
+          },
+          h(
+            'span',
+            {
+              className: cn(
+                'flex size-3 shrink-0 items-center justify-center rounded-full border',
+                on ? 'border-(--ui-accent)' : 'border-(--ui-text-tertiary)'
+              ),
+              style: { marginTop: 3 }
+            },
+            on ? h('span', { className: 'size-1.5 rounded-full bg-(--ui-accent)' }) : undefined
+          ),
+          h(
+            'span',
+            { className: 'flex min-w-0 flex-1 flex-col gap-0.5' },
+            h('span', { className: cn('text-xs', on ? 'font-medium text-foreground' : 'text-(--ui-text-tertiary)') }, m.label),
+            on ? h('span', { className: HINT }, m.description) : undefined,
+            on && gpuModes.summary
+              ? h(
+                  'span',
+                  { className: cn('text-[10px] leading-snug', degraded ? '' : 'text-foreground'), style: degraded ? WARN : undefined },
+                  `${t('gpuModeNow')} ${gpuModes.summary}`
+                )
+              : undefined
+          )
+        )
+      })
+    )
+  )
+}
+
+// The same behaviour settings the dashboard shows; each one saves on change.
+function SettingsSection({ settings, gpuModes, disabled, onSave, onPickMode }) {
+  const s = settings || {}
+  const [idle, setIdle] = useState(null) // text being edited; null = show the saved value
+  const idleText = idle == null ? String(s.idle_restore_min ?? '') : idle
+  const idleNum = /^\d+$/.test(idleText.trim()) ? parseInt(idleText, 10) : NaN
+  const idleBad = idle != null && !(idleNum >= 0 && idleNum <= 720)
+  function commitIdle() {
+    if (idle == null || idleBad) return
+    if (idleNum === s.idle_restore_min) return setIdle(null)
+    Promise.resolve(onSave('idle_restore_min', idleNum)).then(() => setIdle(null))
+  }
+  return h(
+    'div',
+    { className: 'flex flex-col gap-1.5' },
+    h('div', { className: SECTION }, t('settingsHeader')),
+    (gpuModes.modes || []).length ? h(GpuModePicker, { gpuModes, disabled, onPick: onPickMode }) : undefined,
+    settings
+      ? h(
+          'div',
+          { className: cn(CARD, 'flex flex-col') },
+          h('span', { className: 'px-2 py-1.5 text-[10px] font-medium text-(--ui-text-tertiary)' }, t('automationTitle')),
+          h(
+            SettingRow,
+            { id: 'sms-set-after', label: t('setAfterJob'), hint: t('setAfterJobHint') },
+            h(Segmented, {
+              labelId: 'sms-set-after',
+              value: s.after_gpu_job,
+              disabled,
+              options: [['small', t('setAfterSmall')], ['primary', t('setAfterPrimary')]],
+              onChange: v => onSave('after_gpu_job', v)
+            })
+          ),
+          h(
+            SettingRow,
+            { id: 'sms-set-idle', label: t('setIdle'), hint: t('setIdleHint'), error: idleBad ? t('setIdleBad') : null },
+            h('input', {
+              'aria-labelledby': 'sms-set-idle',
+              inputMode: 'numeric',
+              value: idleText,
+              disabled,
+              onChange: e => setIdle(e.target.value),
+              onBlur: commitIdle,
+              onKeyDown: e => (e.key === 'Enter' ? commitIdle() : e.key === 'Escape' ? setIdle(null) : null),
+              className: cn(
+                'w-10 rounded-[3px] border bg-transparent px-1 py-0.5 text-right text-xs outline-none focus:border-(--ui-accent)',
+                'border-(--ui-stroke-secondary)'
+              ),
+              style: idleBad ? BAD_BORDER : undefined
+            }),
+            h('span', { className: HINT }, t('setIdleUnit'))
+          ),
+          h(
+            SettingRow,
+            { id: 'sms-set-recover', label: t('setRecover'), hint: t('setRecoverHint') },
+            h(Toggle, { labelId: 'sms-set-recover', value: !!s.auto_recover, disabled, onChange: v => onSave('auto_recover', v) })
+          ),
+          h(
+            SettingRow,
+            { id: 'sms-set-autostart', label: t('setAutostart'), hint: t('setAutostartHint') },
+            h(Toggle, { labelId: 'sms-set-autostart', value: !!s.autostart_primary, disabled, onChange: v => onSave('autostart_primary', v) })
+          )
+        )
+      : undefined
+  )
+}
+
 function ProviderCard({ provider, onCall }) {
   const [pending, setPending] = useState(false)
   const [note, setNote] = useState(null)
@@ -1337,7 +1589,7 @@ function ProviderCard({ provider, onCall }) {
       pv.error ? jsx('div', { className: 'text-[10px] text-destructive', children: pv.error }) : null,
       pv.foreign
         ? jsx('div', {
-            className: 'text-[10px] text-(--ui-warning,#d29922)',
+            style: WARN, className: 'text-[10px]',
             children: t('providerForeign', pv.path)
           })
         : null,
@@ -1556,16 +1808,20 @@ function SwapPane({ rest }) {
         )
     })
   }
-  // ---- GPU job mode: what gpu_job.sh does with the LLM during a VRAM-heavy job
+  // ---- settings (GPU job mode + automation): saved on change
   const gpuModes = (data && data.gpu_job_modes) || {}
-  const gpuModeList = gpuModes.modes || []
-  const gpuModeSel = gpuModeList.find(m => m.id === gpuModes.mode) || null
-  function pickGpuMode(id) {
-    const m = gpuModeList.find(x => x.id === id)
-    call('/gpu_job/mode', { mode: id }, 'gpumode').then(r => {
-      if (r && r.ok) flash('ok', t('gpuModeSaved', m ? m.label : id))
+  function pickGpuMode(m) {
+    call('/gpu_job/mode', { mode: m.id }, 'gpumode').then(r => {
+      if (r && r.ok) flash('ok', t('gpuModeSaved', m.label))
     })
   }
+  function saveSetting(key, value) {
+    return call('/settings', { key, value }, 'setting').then(r => {
+      if (r && r.ok) flash('ok', t('setSaved'))
+      return r
+    })
+  }
+  const vram = Array.isArray(status.vram) ? status.vram : []
 
   function slotSelect(slot, value) {
     return jsxs('select', {
@@ -1619,7 +1875,7 @@ function SwapPane({ rest }) {
               }),
               gpuJob
                 ? jsx('div', {
-                    className: 'mt-1 text-[11px] text-(--ui-warning,#d29922)',
+                    style: WARN, className: 'mt-1 text-[11px]',
                     children: t(
                       current === '—' ? 'gpuJobUnloadedNote' : 'gpuJobRunningNote',
                       gpuJob.job,
@@ -1651,6 +1907,35 @@ function SwapPane({ rest }) {
                     : null
                 ]
               }),
+              vram.length
+                ? jsx('div', {
+                    className: 'mt-1.5 flex flex-col gap-1',
+                    children: vram.map(g =>
+                      jsxs(
+                        'div',
+                        {
+                          className: 'flex items-center gap-1.5 text-[10px] text-(--ui-text-tertiary)',
+                          title: g.name,
+                          children: [
+                            jsx('span', { className: 'w-9 shrink-0', children: `GPU ${g.gpu}` }),
+                            jsx('div', {
+                              className: 'h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-(--ui-stroke-secondary)',
+                              children: jsx('div', {
+                                className: 'h-full rounded-full bg-(--ui-accent)',
+                                style: { width: `${g.total_mib ? Math.round((g.used_mib / g.total_mib) * 100) : 0}%` }
+                              })
+                            }),
+                            jsx('span', {
+                              className: 'shrink-0 tabular-nums',
+                              children: t('vramOf', (g.used_mib / 1024).toFixed(1), freeGb(g.total_mib))
+                            })
+                          ]
+                        },
+                        g.gpu
+                      )
+                    )
+                  })
+                : null,
               lastError
                 ? jsx('div', { className: 'mt-1 text-[11px] text-destructive', children: lastError })
                 : null
@@ -1678,12 +1963,13 @@ function SwapPane({ rest }) {
               disabled: switchDisabled,
               onClick: toggle,
               className: cn(
-                'relative mb-0.5 h-6 w-11 shrink-0 rounded-full border border-(--ui-stroke-secondary) transition-colors',
+                'relative mb-0.5 h-6 shrink-0 rounded-full border border-(--ui-stroke-secondary) transition-colors',
                 switchDisabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-(--chrome-action-hover)'
               ),
+              style: { width: 44 },
               children: jsx('span', {
-                className: 'absolute left-[3px] top-[3px] size-4 rounded-full bg-(--ui-accent) transition-transform',
-                style: { transform: onSecondary ? 'translateX(20px)' : 'none' }
+                className: 'absolute size-4 rounded-full bg-(--ui-accent) transition-transform',
+                style: { left: 3, top: 3, transform: onSecondary ? 'translateX(20px)' : 'none' }
               })
             }),
             jsxs('div', {
@@ -1718,61 +2004,6 @@ function SwapPane({ rest }) {
             })
           : null,
 
-        // ---- GPU job mode selector
-        gpuModeList.length
-          ? jsxs('div', {
-              className: 'flex flex-col gap-1',
-              children: [
-                jsx(Tip, {
-                  label: t('gpuModeTip'),
-                  children: jsx('span', {
-                    className: 'w-fit text-[10px] font-medium uppercase tracking-wide text-(--ui-text-tertiary)',
-                    children: t('gpuModeTitle')
-                  })
-                }),
-                jsx('div', {
-                  role: 'radiogroup',
-                  'aria-label': t('gpuModeTitle'),
-                  className: 'flex flex-wrap gap-1',
-                  children: gpuModeList.map(m =>
-                    jsx(
-                      'button',
-                      {
-                        type: 'button',
-                        role: 'radio',
-                        'aria-checked': m.id === gpuModes.mode ? 'true' : 'false',
-                        title: m.description,
-                        disabled: !!busy,
-                        onClick: () => (m.id === gpuModes.mode ? null : pickGpuMode(m.id)),
-                        className: cn(
-                          'rounded-[3px] border px-2 py-0.5 text-xs transition-colors',
-                          m.id === gpuModes.mode
-                            ? 'border-(--ui-accent) text-(--ui-accent)'
-                            : 'border-(--ui-stroke-secondary) text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground',
-                          busy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
-                        ),
-                        children: m.label
-                      },
-                      m.id
-                    )
-                  )
-                }),
-                gpuModeSel
-                  ? jsx('div', { className: 'text-[11px] text-(--ui-text-tertiary)', children: gpuModeSel.description })
-                  : null,
-                gpuModes.summary
-                  ? jsx('div', {
-                      className: cn(
-                        'text-[11px]',
-                        gpuModes.layout && gpuModes.layout.degraded ? 'text-(--ui-yellow,#d29922)' : 'text-(--ui-text-tertiary)'
-                      ),
-                      children: `${t('gpuModeNow')} ${gpuModes.summary}`
-                    })
-                  : null
-              ]
-            })
-          : null,
-
         lastAction && Date.now() - lastAction.at < 12000
           ? jsx('div', {
               className: cn(
@@ -1782,6 +2013,17 @@ function SwapPane({ rest }) {
               children: lastAction.text
             })
           : null,
+
+        jsx(Separator, {}),
+
+        // ---- settings: GPU job mode + automation
+        h(SettingsSection, {
+          settings: data && data.settings,
+          gpuModes,
+          disabled: !!busy,
+          onSave: saveSetting,
+          onPickMode: pickGpuMode
+        }),
 
         jsx(Separator, {}),
 

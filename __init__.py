@@ -64,7 +64,7 @@ def register(ctx) -> None:
     # serve` and the dashboard backend also load plugins and must not).
     try:
         if _is_gateway_process():
-            res = tools.autostart_primary()
+            res = tools.autostart_primary(replace=True)
             log.info("smart-model-swap autostart: %s", res.get("skipped") or res.get("note") or res)
             # a smaller model left serving across a gateway restart still gets its idle watcher
             res = tools.ensure_idle_watch()

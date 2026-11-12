@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 **Catalog review**
 - **Minimal environment for the engine and `nvidia-smi`.** They no longer inherit the Hermes process environment (provider API keys included): only `PATH`, `HOME`, `LANG`/`LC_*`, `LD_LIBRARY_PATH`, `TMPDIR`, `USER`/`LOGNAME`, `CUDA_*`, `GGML_*`, the user-bus variables `systemd-run --user --scope` needs (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`), plus the `env` overrides of the engine and the model in `models.json`. A model that needs another variable (e.g. `HF_TOKEN`) declares it there.
@@ -8,9 +8,12 @@
 - Gateway detection uses `gateway.status.looks_like_gateway_command_line`; the dashboard no longer injects its stylesheet (the host loads the manifest css); settings are written with `ctx.set_config` when the plugin context exists in the process.
 
 **Features and fixes**
+- **Start-up always loads the primary.** When the gateway starts and a non-primary model was left serving (e.g. across a gateway restart), it is swapped for the primary through a normal restore (grace, drain, release gate; falls back to what was serving). Before, autostart only acted when nothing held the port. A running `gpu_job.sh` or ComfyUI is left alone (the idle restore brings the primary back). `hermes sms start` is unchanged: it only loads when nothing is serving.
 - **Fast reply after a GPU job.** `gpu_job.sh` no longer reloads the primary when the job ends: the small model (already loaded, or the smallest that fits after `none`) delivers the result. The primary returns on demand (`sms_restore`) or through the idle restore. New setting `after_gpu_job` (`small` default, `primary` = old behaviour) and CLI `hermes sms after-job`.
 - **`gpu_job.sh auto`.** Machine-aware placement: with 2+ GPUs the small model is loaded whole on one GPU (`hermes sms swap <model> --gpu N`, `sms_swap(gpu=N)`) and the job gets another GPU (`$SMS_TASK_GPU`), so no reload is needed when it ends; with one GPU the LLM is unloaded during the job. New CLI `hermes sms job-layout`; `sms_plan` returns it as `gpu_job_auto`. Pinned layouts get their own VRAM profile.
 - **GPU job mode selector** in the dashboard and Desktop (setting `gpu_job_mode`): **Auto** (best for the machine), **None** (unload the LLM), **Nano** (keep the small model), **Multi** (small model on one GPU, another GPU for the job) and **Keep** (leave the loaded model alone). `gpu_job.sh auto` applies the selected mode; a mode that is not possible degrades to None and says why. API: `GET /state` → `gpu_job_modes`, `POST /gpu_job/mode`; CLI: `hermes sms job-layout --mode`.
+- **Automation settings in both UIs** (dashboard card and Desktop section, `POST /settings`): which model answers after a GPU job, idle minutes before the primary returns, auto-recover and primary autostart. The Desktop pane also gains per-GPU VRAM bars and a clearer GPU-mode picker.
+- **Fix (Desktop): styles that never applied.** The Desktop app ships precompiled CSS, so Tailwind classes it does not use itself do nothing in a plugin; the warning colour, error borders and the switch geometry now use inline styles.
 - **Auto-recover** (setting `auto_recover`, default on). A model that fails to load, or whose server dies while serving, is replaced by another model that fits (the primary first, then from small to big) instead of leaving the agent without an LLM. The watcher now runs for every model, the primary included. A model that just failed is not retried automatically for 30 minutes.
 - **Fix: crash on a single-GPU launch.** `-sm tensor|row` is dropped when the model can only use one GPU (pin, `--device X`, single `CUDA_VISIBLE_DEVICES`): llama-server loaded and then aborted on the first decode (`GGML_BACKEND_SPLIT_AXIS_UNKNOWN`).
 - **Fix: release gate inflated the need** of a model whose context was reduced (stale auto-raised `min_free_vram_gb`), blocking the primary although it fitted.

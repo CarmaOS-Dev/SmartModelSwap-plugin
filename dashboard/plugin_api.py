@@ -29,6 +29,8 @@ Endpoints
   POST   /params/preset/delete  remove a named preset from a model
   POST   /provider/install   install SmartModelProvider's model-provider half - user request only
   POST   /provider/remove    remove it again
+  POST   /gpu_job/mode       GPU job mode: what `gpu_job.sh auto` does with the LLM (auto/none/nano/multi/keep)
+  POST   /settings           one behaviour setting: gpu_job_mode, after_gpu_job, idle_restore_min, auto_recover, autostart_primary
   POST   /swap               hot-swap to a model (default: secondary slot)
   POST   /restore            restore the primary model
   GET    /health             re-probe every engine endpoint now (bypasses the cache)
@@ -418,6 +420,11 @@ class GpuJobModeBody(BaseModel):
     mode: str
 
 
+class SettingBody(BaseModel):
+    key: str
+    value: Any
+
+
 class SwapBody(BaseModel):
     model: Optional[str] = None
     dry_run: bool = False
@@ -542,6 +549,27 @@ def _gpu_job_modes() -> list:
     ]
 
 
+# Behaviour settings both UIs expose (the rest stay in the host's settings form).
+# key -> (kind, allowed values | (min, max) | None)
+_UI_SETTINGS = {
+    "gpu_job_mode": ("choice", tools.GPU_JOB_MODES),
+    "after_gpu_job": ("choice", ("small", "primary")),
+    "idle_restore_min": ("int", (0, 720)),
+    "auto_recover": ("bool", None),
+    "autostart_primary": ("bool", None),
+}
+
+
+def _settings_view(cfg: dict) -> dict:
+    return {
+        "gpu_job_mode": tools.gpu_job_mode(),
+        "after_gpu_job": tools.after_job_policy(),
+        "idle_restore_min": int(float(cfg.get("idle_restore_min") or 0)),
+        "auto_recover": bool(cfg.get("auto_recover", True)),
+        "autostart_primary": bool(cfg.get("autostart_primary", True)),
+    }
+
+
 def _gpu_job_view(cfg: dict, status: dict) -> dict:
     """Selected mode + what it means on this machine right now."""
     mode = tools.gpu_job_mode()
@@ -585,6 +613,7 @@ def state() -> dict:
         "config": {"base_url": tools.base_url(reg), "primary_model": cfg["primary_model"],
                    "autostart_primary": cfg.get("autostart_primary")},
         "gpu_job_modes": _gpu_job_view(cfg, status),
+        "settings": _settings_view(cfg),
         "ui": ui,
         "active_engine": tools.active_engine_id(reg),
         "engines": engines_list(reg),
@@ -995,6 +1024,39 @@ def set_gpu_job_mode(body: GpuJobModeBody) -> dict:
                                         f"could not save the mode: {res.get('error')}")}
     cfg = resolve_cfg()
     return {"ok": True, "mode": mode, **_gpu_job_view(cfg, json.loads(tools.h_status({})))}
+
+
+@router.post("/settings")
+def set_ui_setting(body: SettingBody) -> dict:
+    """One behaviour setting from the UI (the same ones in the dashboard and Desktop)."""
+    key = body.key.strip()
+    spec = _UI_SETTINGS.get(key)
+    if not spec:
+        return {"ok": False, "error": t(f"ajuste no editable desde aquí: '{key}'", f"setting not editable here: '{key}'"),
+                "editable": sorted(_UI_SETTINGS)}
+    kind, allowed = spec
+    value = body.value
+    if kind == "bool":
+        if not isinstance(value, bool):
+            return {"ok": False, "error": t(f"'{key}' debe ser verdadero o falso", f"'{key}' must be true or false")}
+    elif kind == "int":
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
+            return {"ok": False, "error": t(f"'{key}' debe ser un número entero", f"'{key}' must be a whole number")}
+        value = int(value)
+        lo, hi = allowed
+        if not lo <= value <= hi:
+            return {"ok": False, "error": t(f"'{key}' debe estar entre {lo} y {hi}", f"'{key}' must be between {lo} and {hi}")}
+    else:
+        value = str(value).strip().lower()
+        if value not in allowed:
+            return {"ok": False, "error": t(f"valor no válido para '{key}': '{value}'", f"invalid value for '{key}': '{value}'"),
+                    "allowed": list(allowed)}
+    res = set_setting(key, value)
+    if not res.get("ok"):
+        return {"ok": False, "error": t(f"no se pudo guardar '{key}': {res.get('error')}",
+                                        f"could not save '{key}': {res.get('error')}")}
+    cfg = resolve_cfg()
+    return {"ok": True, "key": key, "value": value, "settings": _settings_view(cfg)}
 
 
 @router.post("/swap")

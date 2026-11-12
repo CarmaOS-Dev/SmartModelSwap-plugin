@@ -93,3 +93,23 @@ textarea.sms-input { resize: vertical; }
 .sms-mode-name { font-size: 13px; font-weight: 600; }
 .sms-mode.on .sms-mode-name { color: var(--color-primary); }
 .sms-mode-desc { font-size: 12px; line-height: 1.4; color: var(--color-muted-foreground); }
+.sms-set { display: flex; align-items: center; gap: 16px; padding: 8px 0; border-top: 1px solid var(--color-border); }
+.sms-set:first-child { border-top: 0; padding-top: 0; }
+.sms-set-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.sms-set-label { font-size: 13px; }
+.sms-set-control { display: flex; align-items: center; gap: 6px; flex: none; }
+.sms-num { width: 64px; text-align: right; }
+.sms-seg { display: inline-flex; border: 1px solid var(--color-border); border-radius: 4px; overflow: hidden; }
+.sms-seg > button {
+  background: transparent; color: var(--color-muted-foreground); border: 0; padding: 5px 10px; font: inherit;
+  font-size: 12px; cursor: pointer;
+}
+.sms-seg > button + button { border-left: 1px solid var(--color-border); }
+.sms-seg > button.on { background: var(--color-primary); color: var(--color-primary-foreground, #fff); }
+.sms-seg > button:disabled { opacity: .6; cursor: default; }
+.sms-seg > button:focus-visible { outline: 1px solid var(--color-ring); outline-offset: -1px; }
+.sms-switch-sm { width: 40px; height: 22px; border-radius: 11px; }
+.sms-switch-sm > span { width: 14px; height: 14px; background: var(--color-muted-foreground); }
+.sms-switch-sm[aria-checked="true"] { background: var(--color-primary); border-color: var(--color-primary); }
+.sms-switch-sm[aria-checked="true"] > span { transform: translateX(18px); background: var(--color-primary-foreground, #fff); }
+@media (max-width: 520px) { .sms-set { flex-direction: column; align-items: stretch; gap: 6px; } }

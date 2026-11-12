@@ -1,5 +1,5 @@
 name: smart-model-swap
-version: "0.4.0"
+version: "0.5.0"
 manifest_version: 2
 requires_hermes: ">=0.23.0"
 license: MIT
@@ -28,7 +28,7 @@ config_schema:
   autostart_primary:
     type: bool
     label: Autostart the primary model
-    description: When the gateway starts and nothing is serving on the engine's port, SmartModelProvider loads the primary model in the background (replaces the old llama-server systemd unit).
+    description: When the gateway starts, SmartModelProvider always loads the primary model in the background (replaces the old llama-server systemd unit). A smaller model left serving is swapped for it, unless a GPU job or ComfyUI is running.
     default: true
   gpu_wait_s:
     type: int

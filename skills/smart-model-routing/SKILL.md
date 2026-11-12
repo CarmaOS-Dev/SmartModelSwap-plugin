@@ -58,7 +58,7 @@ This skill decides which one to run and how to switch **without breaking the ses
 
   They print JSON with `ok`, `current` and `waited_s`. The exit code is 0 only if the requested model is serving. In the foreground, use `timeout` ≥ 420 s (max 600).
 - `hermes sms check [model] [--wait N]`: the release gate. It reports whether other heavy GPU processes have freed the VRAM the model needs on every GPU.
-- `hermes sms stop [--graceful]` / `hermes sms start`: unload the LLM, or load the primary when nothing is serving.
+- `hermes sms stop [--graceful]` / `hermes sms start`: unload the LLM, or load the primary when nothing is serving (`start` never replaces a model that is serving; use `sms_restore` for that).
 - A swap or restore to the model that is **already loaded** is a free no-op (`"skipped"`). Use `--force` only to reload after editing its flags.
 
 ## Release check (always, before loading the big model)
@@ -119,6 +119,7 @@ The end of a GPU job is **not** a reason to restore: the result is delivered on 
 To restore: `hermes sms check --wait 120`, then `sms_restore()` as the last tool, or `hermes sms restore --wait` to continue in the same turn.
 
 ## What the plugin does on its own
+- **Start-up on the primary.** When the gateway starts, the primary is loaded. If a smaller model was left serving (e.g. across a gateway restart), it is swapped for the primary, unless a `gpu_job.sh` or ComfyUI is running. So after a gateway restart, expect the big model; check `sms_status` before assuming the small one is still loaded.
 - **Idle restore.** After any swap to a smaller model, a watcher brings the primary back once the engine has been idle for `idle_restore_min` minutes (default 15) and the release check passes.
 - **Auto-recover.** If a model fails to load, or its server dies while serving, the plugin loads another model that fits (the primary first, then from small to big). `sms_status` → `last_result.detail.fallback` and `runner.log` (`auto-recover`) say which one. A model that just failed is not retried automatically for 30 min: do not force it back; report the error from `llama-<model>.log`.
 - **Guard.** `terminal` / `execute_code` calls that stop, kill or launch `llama-server` by hand are blocked. So is a ComfyUI launch while the primary holds the GPU, unless it goes through `gpu_job.sh` or carries `SMS_ALLOW_GPU=1` (only after `sms_plan` said `stay`). The block message says what to use instead.

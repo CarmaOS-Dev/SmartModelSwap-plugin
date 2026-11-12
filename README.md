@@ -34,8 +34,8 @@ Smart-Model-Swap cuts the swap from a 13-minute manual ritual to one tool call:
    detached runner stops the model, settles VRAM, loads the target, health-checks.
 4. `sms_restore` → brain back (SMP relaunches the primary with its own command line).
 
-When the Hermes gateway starts and nothing is serving, SMP loads the primary model by
-itself (`autostart_primary`).
+When the Hermes gateway starts, SMP loads the primary model by itself
+(`autostart_primary`), replacing a smaller model that was left serving.
 
 Zero dependencies beyond the Python standard library.
 
@@ -45,11 +45,26 @@ Zero dependencies beyond the Python standard library.
 |---|---|
 | `sms_status` | Swap state machine, current model, per-GPU VRAM, ComfyUI status, last result |
 | `sms_plan` | VRAM-budget recommendation across the model registry |
-| `sms_swap` | Background hot-swap with grace + preflight (`dry_run` supported) |
+| `sms_swap` | Background hot-swap with grace + preflight (`dry_run` supported; `gpu=N` loads the model whole on one GPU) |
 | `sms_restore` | Restore the primary model (SMP relaunches it) |
 
 Slash: `/swap qwen [dry]`, `/swap restore [dry]`, `/swap plan 6`, `/swap status`.
-CLI: `hermes sms status|plan|swap <m> [--dry-run] [--wait] [--force]|restore [--dry-run] [--wait] [--force]|wait [--target m]|start|stop|cmd <m>|provider …`.
+CLI (`hermes sms …`):
+
+| Command | What it does |
+|---|---|
+| `status` | Swap state, engine, per-GPU VRAM, current model, ComfyUI |
+| `plan [--needed-free-gb N] [--task T] [--any-gpu]` | Recommend a model for a VRAM budget |
+| `swap <model> [--dry-run] [--force] [--gpu N] [--wait]` | Hot-swap to a model; `--gpu N` loads it whole on that GPU |
+| `restore [--dry-run] [--force] [--wait]` | Restore the primary model |
+| `check [model] [--wait N]` | Release gate: may this model (default: the primary) load now? |
+| `wait [--target model] [--timeout S]` | Block until no swap/restore/start is in flight |
+| `start` | Load the primary now if nothing is serving |
+| `stop [--graceful]` | Unload the model; `--graceful` adds the grace countdown and drain of a swap |
+| `cmd <model>` | Print the exact launch command of a model |
+| `job-layout [--mode M] [--task-gpu N] [--model M] [--plain]` | Where the LLM and a GPU job go (used by `gpu_job.sh auto`) |
+| `after-job [--prefer model]` | End of a GPU job: keep or load the model that answers (used by `gpu_job.sh`) |
+| `provider status\|install\|remove` | The optional model-provider half |
 
 - `--wait` blocks until the runner finishes and exits 0 only if the requested model is serving. This lets
   scripts (and the agent's terminal) continue on the new model. `hermes sms wait` does the same for a
@@ -184,9 +199,13 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
   (`sms-runner-*`, `sms-llm-*`), so restarting the Hermes gateway does not kill them. This
   only moves them out of the gateway's cgroup: no service, and start/stop never go through
   systemd. Without a user systemd they just get their own session.
-- **Autostart** (`autostart_primary`). This runs only in the `hermes gateway run` process, only
-  when nothing holds the port and no swap is in flight. It waits up to `gpu_wait_s` for the
-  NVIDIA driver and the model file (a WSL mount), which replaces the old unit's `ExecStartPre`.
+- **Autostart** (`autostart_primary`). This runs only in the `hermes gateway run` process and only
+  when no swap is in flight. Start-up always ends on the primary: with nothing on the port it is
+  loaded (waiting up to `gpu_wait_s` for the NVIDIA driver and the model file, a WSL mount, which
+  replaces the old unit's `ExecStartPre`); a registered non-primary model left serving (for example
+  across a gateway restart) is swapped for it through a normal restore. A running `gpu_job.sh` or
+  ComfyUI is left alone (the idle restore brings the primary back later), and so is anything on
+  the port that is not a registered model.
 - **Grace countdown + drain**: the stop happens after `grace_s` (default 10 s) and only once
   the engine reports no in-flight requests (up to `drain_timeout_s`), so the agent's reply is not cut.
 - **Preflight**: engine binary, GGUF/mmproj existence, exact argv accepted by the binary, and VRAM
@@ -198,18 +217,45 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
 - **Fail-safe / auto-recover**: a model that fails to load, or whose server dies while serving, is replaced by
   another model that fits (the primary first, then from small to big; setting `auto_recover`). A failed swap is
   still reported as failed (`ok: false`, `fallback: <model now serving>`).
-- **State and logs:** state lives in `~/.hermes/cache/smart-model-swap/` (`state.json`, runner and per-model logs,
-  cached `--help`).
+- **State and logs:** state lives in `~/.hermes/cache/smart-model-swap/` (`state.json`, runner, per-model and
+  GPU-job logs, cached `--help`). The full list is in [INSTALL.md](./INSTALL.md#state-and-logs).
+
+## GPU jobs (`gpu_job.sh`)
+
+`skills/smart-model-routing/templates/gpu_job.sh <mode> -- <command…>` frees VRAM, runs a GPU job
+(ComfyUI, training, …) in the background and always leaves a model serving when it ends.
+
+| Mode | What happens to the LLM during the job |
+|---|---|
+| `auto` | Applies the mode picked in the UI (setting `gpu_job_mode`). Its default, also `auto`, chooses for the machine: `multi` with 2+ GPUs, otherwise `none`. |
+| `none` | Unloaded: all the VRAM goes to the job. |
+| `nano` | The small model stays loaded in its normal layout. |
+| `multi` | The small model is loaded whole on one GPU and the job gets another (`$SMS_TASK_GPU`). With one GPU it degrades to `none`. |
+| `keep` | The loaded model is left alone (light jobs that fit beside it). |
+
+- A mode that is not possible on the machine degrades to `none` and says why. `hermes sms job-layout`
+  prints what `auto` will do; `sms_plan` returns it as `gpu_job_auto`.
+- **After the job** (setting `after_gpu_job`): `small` (default) delivers the result with the small model
+  — the one already loaded, or the smallest that fits after `none` — and the primary returns on demand
+  (`sms_restore`) or through the idle restore. `primary` reloads the primary right away.
+- The mode selector and the automation settings (`after_gpu_job`, `idle_restore_min`, `auto_recover`,
+  `autostart_primary`) are in both UIs: the dashboard card and the Desktop section.
 
 ## Automation (what happens without the agent asking)
 
+- **Start-up on the primary** (setting `autostart_primary`, default on). When the gateway starts, the primary
+  is loaded. A smaller model left serving (for example across a gateway restart) is swapped for it, unless a
+  `gpu_job.sh` or ComfyUI is running; in that case the idle restore brings it back. See the safety model above.
 - **Idle restore.** After any swap to a non-primary model, the runner spawns a detached watcher
   (`runner.py idle_watch`, an `sms-runner-idle-*` scope, pid in `cache/smart-model-swap/idle_watch.json`).
   - It restores the primary once the engine has been idle for `idle_restore_min` minutes (default 15; 0 disables).
     Idle means: no tokens processed (`/metrics` counters), no `gpu_job.sh` running (`gpu_job.active` marker), and
     no ComfyUI or other GPU users.
-  - It restores only if the release gate passes. The gateway starts a watcher on start-up if a smaller model is
-    left serving.
+  - It restores only if the release gate passes. The gateway starts a watcher on start-up if a smaller model
+    stays serving (a GPU job is running, or the start-up restore was refused).
+  - The same watcher runs for every model, the primary included, for auto-recover: if the server dies while
+    serving, another model that fits is loaded (setting `auto_recover`). A model that just failed is not
+    retried automatically for 30 minutes.
 - **Guard** (`guard.py`, `pre_tool_call`, setting `guard_tools`). It vetoes `terminal` / `execute_code` commands that:
   - stop, kill or launch llama-server behind SMP: `systemctl … llama-server`, `pkill`, `kill $(pgrep …)`,
     `~/llama-server.sh`, a hand-launched `llama-server -m`;
@@ -260,6 +306,9 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
 **Engines** card (`models.json` → `engines`). `llama_bin`, `base_url` and
 `systemd_unit` are only read once, to migrate a 0.2 install.
 
+`gpu_job_mode`, `after_gpu_job`, `idle_restore_min`, `auto_recover` and `autostart_primary` can also be
+changed from the plugin's own UIs (dashboard card and Desktop section); the rest are in the host's settings form.
+
 ### Coming from the `llama-server` systemd unit
 
 Disable the old unit so it does not race SMP for the port at boot:
@@ -287,8 +336,9 @@ What the plugin does on your machine, so you can decide before installing:
 
 - **Long-running processes.**
   - It starts `llama-server` itself: in a transient `systemd-run --user --scope` when available, otherwise in its own session.
-  - A detached runner per swap, and an idle watcher after a swap to a smaller model.
+  - A detached runner per swap, and a watcher per loaded model (idle restore, auto-recover).
   - With `autostart_primary` (default on), the primary model loads, and takes GPU memory, when the gateway starts.
+    A smaller model that was left serving is stopped and replaced by it (unless a GPU job or ComfyUI is running).
 - **Signals.** It sends SIGINT, then SIGKILL after a timeout, only to the engine process it manages, or to an engine
   process of the same kind holding the engine port. It never touches unrelated processes; a port held by anything
   else is reported, not killed.
