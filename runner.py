@@ -110,7 +110,12 @@ def idle_watch(target: str) -> int:
             working = (counter is not None and last_counter is not None and counter != last_counter)
             working = working or (tools.requests_processing() or 0) > 0
             last_counter = counter if counter is not None else last_counter
-            if working or tools.gpu_job_active() or tools.gpu_holders():
+            # Only ComfyUI counts as GPU work here. A resident process that
+            # merely holds some VRAM (an embeddings daemon) must not reset the
+            # idle clock forever: whether the primary fits is the release
+            # gate's call, below.
+            comfy_up = any(h.get("kind") == "comfyui" for h in tools.gpu_holders())
+            if working or tools.gpu_job_active() or comfy_up:
                 last_active = now
                 continue
             if now - last_active < minutes * 60:

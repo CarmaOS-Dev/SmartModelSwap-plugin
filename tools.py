@@ -1322,8 +1322,16 @@ def model_gpu_need(entry: dict, gpus: list[int], data: dict | None = None) -> di
             source = "measured-other-ctx"  # context changed since: a guess until the next load
     if prof:
         per = {int(k): v / 1024.0 for k, v in prof.items() if int(k) in gpus}
-        # never trust a measurement below the declared minimum
-        scale = max(1.0, total / max(0.001, sum(per.values()))) if per else 1.0
+        # A measurement taken with another context is a guess: never let it go
+        # below the declared minimum. One taken with the current context is the
+        # truth, and the declared minimum may be stale: it is auto-raised on
+        # load and never lowered, so after a context reduction it would inflate
+        # the need and block a model that fits.
+        scale = 1.0
+        if per and source != "measured":
+            scale = max(1.0, total / max(0.001, sum(per.values())))
+        if source == "measured" and per:
+            total = sum(per.values())
         return {"per_gpu": {g: v * scale for g, v in per.items()}, "source": source,
                 "total_gib": max(total, sum(per.values()))}
     try:
