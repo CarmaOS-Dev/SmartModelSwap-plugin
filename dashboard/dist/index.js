@@ -193,6 +193,12 @@
       setRecoverHint: "Si un modelo falla al cargar o se cae, se carga otro que quepa.",
       setAutostart: "Cargar el primario al iniciar el gateway",
       setAutostartHint: "Al arrancar Hermes siempre se carga el modelo primario, aunque haya quedado otro sirviendo.",
+      setComfyFree: "Liberar ComfyUI ocioso",
+      setComfyFreeHint: "Si toca volver al primario y no cabe porque un ComfyUI sin trabajo guarda modelos en VRAM, se le pide que los descargue (no se cierra).",
+      watcherOn: (target, min) => "Vigilante activo sobre '" + target + "'" + (min > 0 ? "; el primario vuelve tras " + min + " min sin actividad." : "."),
+      watcherOff: "Sin vigilante: no hay vuelta automática al primario ni auto-recuperación ahora mismo.",
+      holderNote: (txt) => "Otro uso de la GPU: " + txt,
+      failureNote: (m, why, at) => "Fallo reciente de '" + m + "' (" + why + ", " + at + "): no se reintenta solo durante 30 min.",
       setSaved: "Ajuste guardado.",
       setIdleBad: "Escribe un número entero entre 0 y 720.",
       on: "activado", off: "desactivado",
@@ -406,6 +412,12 @@
       setRecoverHint: "If a model fails to load or dies, another one that fits is loaded.",
       setAutostart: "Load the primary when the gateway starts",
       setAutostartHint: "When Hermes starts the primary model is always loaded, even if another one was left serving.",
+      setComfyFree: "Free an idle ComfyUI",
+      setComfyFreeHint: "When the primary is due back but does not fit because an idle ComfyUI keeps models in VRAM, it is asked to unload them (it keeps running).",
+      watcherOn: (target, min) => "Watcher active on '" + target + "'" + (min > 0 ? "; the primary returns after " + min + " idle min." : "."),
+      watcherOff: "No watcher: no automatic return to the primary and no auto-recover right now.",
+      holderNote: (txt) => "Other GPU user: " + txt,
+      failureNote: (m, why, at) => "Recent failure of '" + m + "' (" + why + ", " + at + "): not retried automatically for 30 min.",
       setSaved: "Setting saved.",
       setIdleBad: "Enter a whole number between 0 and 720.",
       on: "on", off: "off",
@@ -1038,6 +1050,17 @@
       onClick: function () { props.onChange(!props.value); }
     }, h("span", null));
   }
+  // Watcher, other GPU users and recent failures, one muted line each.
+  function sysNotes(status, settings) {
+    const out = [];
+    const llmUp = status.llm && status.llm.up;
+    const w = status.watcher;
+    if (w && (w.target || w.pid)) out.push(t("watcherOn", w.target || "?", w.minutes == null ? (settings || {}).idle_restore_min : w.minutes));
+    else if (llmUp) out.push(t("watcherOff"));
+    (status.gpu_holders || []).forEach(function (x) { out.push(t("holderNote", x)); });
+    (status.failures || []).forEach(function (f) { out.push(t("failureNote", f.model, f.why, String(f.at || "").slice(11, 16))); });
+    return out;
+  }
   function Settings(props) {
     const s = props.settings || {};
     const [idle, setIdle] = useState(null); // text being edited, null = show the saved value
@@ -1077,7 +1100,10 @@
           onChange: function (v) { save("auto_recover", v); } })),
       h(SetRow, { id: "sms-set-autostart", label: t("setAutostart"), hint: t("setAutostartHint") },
         h(Toggle, { labelId: "sms-set-autostart", value: !!s.autostart_primary, disabled: props.disabled,
-          onChange: function (v) { save("autostart_primary", v); } })));
+          onChange: function (v) { save("autostart_primary", v); } })),
+      h(SetRow, { id: "sms-set-comfyfree", label: t("setComfyFree"), hint: t("setComfyFreeHint") },
+        h(Toggle, { labelId: "sms-set-comfyfree", value: s.comfy_free_on_idle !== false, disabled: props.disabled,
+          onChange: function (v) { save("comfy_free_on_idle", v); } })));
   }
 
   // SmartModelProvider: the model-provider half of this plugin. It is only
@@ -1246,6 +1272,7 @@
             h("span", { className: "sms-dot " + (llm.up ? tone(state) : gpuJob ? "warn" : "bad") }),
             h("span", { className: "sms-model" }, llm.current || (llm.up ? t("unregisteredModel") : state === "starting" ? t("startingUp") : gpuJob ? t("gpuJobUnloaded") : t("serverDown")))),
           gpuJob ? h("div", { className: "sms-warn" }, t(llm.up ? "gpuJobRunningNote" : "gpuJobUnloadedNote", gpuJob.job, Math.floor((gpuJob.elapsed_s || 0) / 60))) : null,
+          h("div", { className: "sms-col sms-muted" }, sysNotes(status, data && data.settings).map(function (n, i) { return h("span", { key: i }, n); })),
           h("div", { className: "sms-row sms-muted" },
             h("span", null, t("stateText", stateText)),
             activeEngine.label ? h("span", null, t("engineText", activeEngine.label)) : null,

@@ -55,20 +55,25 @@ CLI (`hermes sms …`):
 |---|---|
 | `status` | Swap state, engine, per-GPU VRAM, current model, ComfyUI |
 | `plan [--needed-free-gb N] [--task T] [--any-gpu]` | Recommend a model for a VRAM budget |
-| `swap <model> [--dry-run] [--force] [--gpu N] [--wait]` | Hot-swap to a model; `--gpu N` loads it whole on that GPU |
-| `restore [--dry-run] [--force] [--wait]` | Restore the primary model |
+| `swap <model> [--dry-run] [--force] [--gpu N] [--wait] [--timeout S]` | Hot-swap to a model; `--gpu N` loads it whole on that GPU |
+| `restore [--dry-run] [--force] [--wait] [--timeout S]` | Restore the primary model |
 | `check [model] [--wait N]` | Release gate: may this model (default: the primary) load now? |
 | `wait [--target model] [--timeout S]` | Block until no swap/restore/start is in flight |
 | `start` | Load the primary now if nothing is serving |
 | `stop [--graceful]` | Unload the model; `--graceful` adds the grace countdown and drain of a swap |
 | `cmd <model>` | Print the exact launch command of a model |
 | `job-layout [--mode M] [--task-gpu N] [--model M] [--plain]` | Where the LLM and a GPU job go (used by `gpu_job.sh auto`) |
-| `after-job [--prefer model]` | End of a GPU job: keep or load the model that answers (used by `gpu_job.sh`) |
+| `after-job [--prefer model] [--timeout S]` | End of a GPU job: keep or load the model that answers (used by `gpu_job.sh`) |
 | `provider status\|install\|remove` | The optional model-provider half |
 
-- `--wait` blocks until the runner finishes and exits 0 only if the requested model is serving. This lets
-  scripts (and the agent's terminal) continue on the new model. `hermes sms wait` does the same for a
-  swap that is already running.
+- `--wait` blocks until the runner finishes and exits 0 only if the requested model is serving. It is
+  meant for **scripts** such as `gpu_job.sh`. If another swap is running, it waits for that one and then
+  asks again. `hermes sms wait` waits for a swap that is already running.
+- **`--timeout` defaults to the swap budget**: the worst case of that swap, computed from the settings
+  (see [Timeouts](#timeouts)). A wait that times out does not cancel anything; the swap goes on.
+- **The agent never runs these in a foreground terminal.** The guard blocks foreground
+  `swap/restore --wait`, `wait`, `after-job` and `stop --graceful`. The agent calls `sms_swap` /
+  `sms_restore` as the last tool of its turn instead.
 - A swap or restore to the model that is **already serving** is a no-op (`"skipped"`). Use `--force` to
   reload it anyway, e.g. after editing its flags.
 - **Release gate.** A model is loaded only when every GPU it uses has room for its share.
@@ -195,10 +200,16 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
   start that holds the engine's port (for example from a terminal) gets the same
   signal on its PID. A port held by a process that is not the engine is never touched.
   There is never a machine-wide `pkill`.
-- **Own cgroup** (`isolate_scope`). The runner and the models run in transient user scopes
-  (`sms-runner-*`, `sms-llm-*`), so restarting the Hermes gateway does not kill them. This
-  only moves them out of the gateway's cgroup: no service, and start/stop never go through
-  systemd. Without a user systemd they just get their own session.
+- **Detached from whoever asked** (`isolate_scope`).
+  - The runner and the watcher run as transient user **services** (`sms-runner-*.service`). Their parent
+    is systemd, not the gateway or the CLI that started the swap.
+  - So neither a gateway restart nor a killed command can take a model load down with it. A killed
+    command is, for example, a terminal tool timing out on `hermes sms restore --wait`, or a killed
+    `gpu_job.sh`.
+  - Each model runs in its own transient **scope** (`sms-llm-*.scope`). SMP still starts and stops it
+    itself, by signal; systemd only holds the cgroup.
+  - Without a user systemd, runners are double-forked into their own session. They survive a killed
+    command, but not a gateway restart.
 - **Autostart** (`autostart_primary`). This runs only in the `hermes gateway run` process and only
   when no swap is in flight. Start-up always ends on the primary: with nothing on the port it is
   loaded (waiting up to `gpu_wait_s` for the NVIDIA driver and the model file, a WSL mount, which
@@ -207,10 +218,15 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
   ComfyUI is left alone (the idle restore brings the primary back later), and so is anything on
   the port that is not a registered model.
 - **Grace countdown + drain**: the stop happens after `grace_s` (default 10 s) and only once
-  the engine reports no in-flight requests (up to `drain_timeout_s`), so the agent's reply is not cut.
+  the engine has stayed without in-flight requests for `drain_quiet_s` (default 8 s; a turn is a chain of
+  requests with short gaps), so the agent's reply is not cut.
 - **Preflight**: engine binary, GGUF/mmproj existence, exact argv accepted by the binary, and VRAM
   fit are all checked before anything is touched. `dry_run` works everywhere.
-- **Stale runner detection**: state tracks the runner PID; a dead runner unblocks new swaps.
+- **Stale runner detection**: each runner records its PID and process start time (a recycled PID is not
+  mistaken for it); a dead runner unblocks new swaps, and the watcher resumes its swap (below).
+- **Locked state**: `state.json` and `vram_profile.json` are updated under a file lock, so the gateway, the
+  CLI, the runner and the watcher never overwrite each other's fields. A state file that does not parse is
+  kept as `state.json.corrupt`.
 - **VRAM settle**: after a stop we wait until VRAM stops moving before loading.
 - **Verified load**: a start only succeeds when `/health` is OK *and* the server reports the
   requested model; a process that dies during load fails immediately with its log tail.
@@ -249,31 +265,49 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
 - **Idle restore.** After any swap to a non-primary model, the runner spawns a detached watcher
   (`runner.py idle_watch`, an `sms-runner-idle-*` scope, pid in `cache/smart-model-swap/idle_watch.json`).
   - It restores the primary once the engine has been idle for `idle_restore_min` minutes (default 15; 0 disables).
-    Idle means: no tokens processed (`/metrics` counters), no `gpu_job.sh` running (`gpu_job.active` marker), and
-    no ComfyUI or other GPU users.
-  - It restores only if the release gate passes. The gateway starts a watcher on start-up if a smaller model
-    stays serving (a GPU job is running, or the start-up restore was refused).
+    Idle means:
+    - no tokens processed (`/metrics` counters);
+    - no `gpu_job.sh` running (`gpu_job.active` marker);
+    - no **work in ComfyUI's queue** (`/queue`). A ComfyUI that is merely open does not stop the clock.
+  - It restores only if the release gate passes. If the primary does not fit because an idle ComfyUI still
+    caches models in VRAM, ComfyUI is asked to unload them (`POST /free`, setting `comfy_free_on_idle`). It keeps
+    running; nothing is killed.
+  - The gateway starts a watcher on start-up if a smaller model stays serving (a GPU job is running, or the
+    start-up restore was refused).
+  - One watcher at a time: it holds `idle_watch.lock` for its whole life.
   - The same watcher runs for every model, the primary included, for auto-recover: if the server dies while
     serving, another model that fits is loaded (setting `auto_recover`). A model that just failed is not
-    retried automatically for 30 minutes.
+    retried automatically for 30 minutes. A model stopped by a signal from outside SMP is loaded again once.
+  - **Interrupted swaps resume.** If a swap's runner dies mid-flight, the watcher relaunches the same swap
+    once, without counting it as a model failure. This covers a runner killed together with the command that
+    started it (before 0.5.1). If the model came up anyway, only the state is fixed.
 - **Guard** (`guard.py`, `pre_tool_call`, setting `guard_tools`). It vetoes `terminal` / `execute_code` commands that:
   - stop, kill or launch llama-server behind SMP: `systemctl … llama-server`, `pkill`, `kill $(pgrep …)`,
     `~/llama-server.sh`, a hand-launched `llama-server -m`;
-  - start ComfyUI while the primary holds the GPU, unless they go through `gpu_job.sh` or carry `SMS_ALLOW_GPU=1`.
+  - start ComfyUI while **any** model is loaded or a swap is running, unless they actually run `gpu_job.sh` or
+    carry `SMS_ALLOW_GPU=1`;
+  - run a blocking `hermes sms` command in the foreground: `swap|restore --wait`, `wait`, `after-job`,
+    `stop --graceful` (allowed with `background=true` and `notify=true`);
+  - run `gpu_job.sh` in the foreground, or in the background without `notify=true`.
 
+  Every segment of the command is checked: mentioning `hermes sms` or `gpu_job.sh` no longer exempts the rest.
   Shell scripts run by the command are scanned too. Read-only commands are never blocked. Blocks are logged to
   `cache/smart-model-swap/guard.log`.
-- **Hints** (`hints.py`, `pre_llm_call` + `pre_transcription`). The hook injects one line, throttled to once per
-  20 min per session and never within 10 min of a swap, when:
+- **Hints** (`hints.py`, `pre_llm_call` + `pre_transcription`). Each hint is throttled to once per 20 min per
+  session and kind:
   - a GPU job is requested while the primary is loaded;
-  - deep work is requested on the small model;
-  - a voice conversation is detected (2+ transcribed clips in 15 min) on the primary.
-- **Unloaded on purpose ≠ error** (setting `block_when_unloaded`). While a `gpu_job.sh` holds the GPU, or a
-  swap or load is in flight, and the engine is not serving, a new turn is ended at once by the `pre_llm_call` veto
-  with an explanation, and the user is asked to resend. Without this, Hermes retries for minutes and fails with
+  - deep work is requested on the small model (advice: `sms_restore` as the last tool);
+  - a voice conversation is detected (2+ transcribed clips in 15 min) on the primary, and not within 10 min of a
+    swap;
+  - while the small model serves, a one-line status every turn, with its longer guidance once per cooldown.
+- **Unloaded on purpose ≠ error** (setting `block_when_unloaded`, independent of `inject_status`). While a
+  `gpu_job.sh` holds the GPU, a swap or load is in flight, or an interrupted swap is being resumed, and the engine
+  is not serving, a new turn is ended at once by the `pre_llm_call` veto with an explanation, and the user is
+  asked to resend. Without this, Hermes retries for minutes and fails with
   `HTTP 503: Loading model`. Turns started while the LLM is down for an unknown reason are left to Hermes' own
   recovery. `gpu_job.sh none` unloads with `hermes sms stop --graceful` (grace + drain, like a swap), and the guard
-  refuses a `gpu_job.sh` that is not run in the background.
+  refuses a `gpu_job.sh` that is not run in the background with `notify=true` (without it the agent is never
+  told the job ended and the result is not delivered).
 - **Progress-aware drain.** Before cutting a model, in-flight requests are allowed to finish while they keep
   generating, up to `drain_max_s` (600). A request is cut early only after `drain_timeout_s` (120) without progress.
 - **Measured VRAM.** Each load records per-GPU usage. The median of the last 5 loads is kept in
@@ -285,6 +319,50 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
   Saving a model with a new `-c` applies it to every model of that engine; a model saved without `-c` gets the
   shared one. Both UIs show this live under the parameter table, and the save message names the models that changed.
   VRAM measurements are keyed by context, so a context change never mixes old and new numbers.
+
+## Timeouts
+
+| What | Default | Where |
+|---|---|---|
+| Grace before the cut | 10 s | `grace_s` |
+| Drain: quiet window / stall / cap | 8 s / 120 s / 600 s | `drain_quiet_s`, `drain_timeout_s`, `drain_max_s` |
+| Stop: SIGINT, then SIGKILL | 25 s | fixed |
+| VRAM settle | 90 s | `vram_settle_timeout_s` |
+| Release gate (other GPU users) | 120 s | `release_wait_s` |
+| Model load | 120 s, per model | `load_timeout_s` in `models.json` |
+| **Swap budget** (default for every `--wait`/`--timeout`) | grace + drain cap + 45 s (stop) + settle + release + load + 60 s margin (≈ 22 min for a 420 s load) | `sms_status` → `swap_budget_s` |
+| Autostart: GPU driver and model file | 180 s | `gpu_wait_s` |
+| Idle restore | 15 min | `idle_restore_min` |
+| A failed model is not auto-retried | 30 min | fixed |
+| Hints | 20 min per kind; voice not within 10 min of a swap | fixed |
+| Hermes terminal tool (foreground) | 180 s default, 600 s max | Hermes: why blocking `hermes sms` commands never run there |
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `runner.log`: "killed together with the process that started it … resuming it" | A swap's runner died mid-flight. The watcher relaunches it once; nothing to do. Twice in 30 min → state `failed`; read `runner.log`. |
+| Small model stays loaded for hours | `sms_status` → `gpu_holders`/`watcher`. A ComfyUI with work queued pauses the idle clock; no watcher means nobody restores (start one with any swap, or `sms_restore`). |
+| `RESULT free=FAILED — job NOT run` in a `gpu_job_*.log` | The swap before the job failed or another `gpu_job.sh` was running (exit 3). Check `sms_status`; relaunch once `swap.state` is `idle`. |
+| `hermes sms start` does nothing | It is the autostart path: it is skipped while `autostart_primary` is off. Use `hermes sms restore`. |
+| `gpu_job.active` left behind | Harmless: it holds a PID; a dead PID counts as no job. |
+| Guard blocks `hermes sms restore --wait` | By design (see Guard). From the agent: `sms_restore` as the last tool. From a script: run it outside the terminal tool's foreground. |
+| `state.json.corrupt` appears | A state file did not parse; it was kept for inspection and a fresh state started. |
+
+Logs: `~/.hermes/cache/smart-model-swap/` (the active profile's home): `runner.log` (+ `.1`), `llama-<model>.log`,
+`gpu_job_*.log` (kept 14 days), `guard.log`, `state.json`, `vram_profile.json`.
+
+## Development
+
+Tests use only the standard library and never load, stop or signal a real model:
+
+```bash
+cd ~/.hermes/plugins/smart-model-swap
+~/.hermes/tools/python-3.14.9+20261021-linux-x64/bin/python3 -m unittest discover -s tests -v
+```
+
+(Any Python ≥ 3.10 works; use the one the gateway runs.) `guard.py`, `hints.py` and `__init__.py` live in the
+gateway process: a change needs a gateway restart. `runner.py` and `tools.py` are read again by every new runner.
 
 ## Languages (es / en)
 
@@ -299,15 +377,15 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
 ## Settings (plugin.yaml → Hermes Desktop settings)
 
 `primary_model`, `autostart_primary`, `gpu_wait_s`, `isolate_scope`, `models_file`,
-`nvidia_smi`, `grace_s`, `drain_timeout_s`, `drain_max_s`, `release_wait_s`, `idle_restore_min`,
-`gpu_job_mode`, `after_gpu_job`, `auto_recover`,
+`nvidia_smi`, `grace_s`, `drain_timeout_s`, `drain_max_s`, `drain_quiet_s`, `release_wait_s`, `idle_restore_min`,
+`gpu_job_mode`, `after_gpu_job`, `auto_recover`, `comfy_free_on_idle`,
 `vram_settle_mib`, `vram_settle_timeout_s`, `comfy_url`, `inject_status`, `guard_tools`,
 `block_when_unloaded`. The engine binary, host and port are now in the
 **Engines** card (`models.json` → `engines`). `llama_bin`, `base_url` and
 `systemd_unit` are only read once, to migrate a 0.2 install.
 
-`gpu_job_mode`, `after_gpu_job`, `idle_restore_min`, `auto_recover` and `autostart_primary` can also be
-changed from the plugin's own UIs (dashboard card and Desktop section); the rest are in the host's settings form.
+`gpu_job_mode`, `after_gpu_job`, `idle_restore_min`, `auto_recover`, `autostart_primary` and
+`comfy_free_on_idle` can also be changed from the plugin's own UIs (dashboard card and Desktop section); the rest are in the host's settings form.
 
 ### Coming from the `llama-server` systemd unit
 
@@ -336,7 +414,9 @@ What the plugin does on your machine, so you can decide before installing:
 
 - **Long-running processes.**
   - It starts `llama-server` itself: in a transient `systemd-run --user --scope` when available, otherwise in its own session.
-  - A detached runner per swap, and a watcher per loaded model (idle restore, auto-recover).
+  - A detached runner per swap, and one watcher for the loaded model (idle restore, auto-recover), as transient
+    `systemd-run --user` services when available, otherwise double-forked. They get an allow-listed environment
+    (no provider API keys).
   - With `autostart_primary` (default on), the primary model loads, and takes GPU memory, when the gateway starts.
     A smaller model that was left serving is stopped and replaced by it (unless a GPU job or ComfyUI is running).
 - **Signals.** It sends SIGINT, then SIGKILL after a timeout, only to the engine process it manages, or to an engine
@@ -358,7 +438,8 @@ What the plugin does on your machine, so you can decide before installing:
   - Can veto `terminal` / `execute_code` calls that would manage the engine by hand.
   - Can end a turn at once, with an explanation, while the LLM is unloaded on purpose.
 - **Network.** HTTP only to the endpoints you configure: the engine (default `127.0.0.1:8080`), ComfyUI (default
-  `127.0.0.1:8188`), and the health endpoints of the detection-only engines. No third-party services.
+  `127.0.0.1:8188`: `/system_stats`, `/queue`, and `POST /free` when `comfy_free_on_idle` applies), and the health
+  endpoints of the detection-only engines. No third-party services.
 - **No** telemetry, stored credentials, self-updater or approval bypass.
 
 ## License

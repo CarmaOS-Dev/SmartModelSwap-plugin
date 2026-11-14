@@ -48,6 +48,7 @@ DEFAULTS: dict = {
     "grace_s": 10,
     "drain_timeout_s": 120,
     "drain_max_s": 600,
+    "drain_quiet_s": 8,
     "vram_settle_mib": 300,
     "vram_settle_timeout_s": 90,
     "comfy_url": "http://127.0.0.1:8188",
@@ -62,6 +63,7 @@ DEFAULTS: dict = {
     "gpu_job_mode": "auto",
     "auto_recover": True,
     "isolate_scope": True,
+    "comfy_free_on_idle": True,
     # Legacy (<= 0.2): read once to migrate models.json to v2, then unused.
     "llama_bin": "",
     "base_url": "",
@@ -69,8 +71,13 @@ DEFAULTS: dict = {
 }
 
 BUSY_STATES = ("grace", "swapping", "restoring", "starting")
+BOOL_KEYS = ("inject_status", "autostart_primary", "isolate_scope", "auto_recover",
+             "guard_tools", "block_when_unloaded", "comfy_free_on_idle")
 RUNNER_SCOPE_PREFIX = "sms-runner-"
 LLM_SCOPE_PREFIX = "sms-llm-"
+# A runner is spawned detached and registers its own pid once it holds the
+# swap lock; until then a fresh busy state counts as in flight.
+SPAWN_GRACE_S = 30
 
 _CFG: dict = dict(DEFAULTS)
 PLUGIN_CTX = None  # the PluginContext, when register(ctx) ran in this process
@@ -90,7 +97,7 @@ def apply_cfg(cfg: dict) -> None:
         v = cfg.get(k)
         if v not in (None, ""):
             merged[k] = v
-    for k in ("inject_status", "autostart_primary", "isolate_scope", "auto_recover"):
+    for k in BOOL_KEYS:
         merged[k] = _as_bool(merged[k])
     _CFG = merged
 
@@ -112,10 +119,20 @@ def hermes_home() -> Path:
         return Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
 
 
+_CHILD_ENV_KEEP = ("HOME", "PATH", "LANG", "LANGUAGE", "LD_LIBRARY_PATH", "TMPDIR", "USER",
+                   "LOGNAME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "PYTHONPATH",
+                   "VIRTUAL_ENV", "WSL_INTEROP", "WSLENV", "WSL_DISTRO_NAME")
+_CHILD_ENV_PREFIXES = ("LC_", "CUDA_", "GGML_", "SMS_")
+
+
 def child_env() -> dict:
-    """Environment for our own detached runner / watcher: the parent's, with the
-    resolved Hermes home pinned so both sides agree on where the state lives."""
-    return dict(os.environ, HERMES_HOME=str(hermes_home()))
+    """Environment for our own detached runner / watcher: an allow-list of the
+    parent's (no provider API keys), with the resolved Hermes home pinned so
+    both sides agree on where the state lives."""
+    env = {k: v for k, v in os.environ.items()
+           if k in _CHILD_ENV_KEEP or k.startswith(_CHILD_ENV_PREFIXES)}
+    env["HERMES_HOME"] = str(hermes_home())
+    return env
 
 
 def cache_dir() -> Path:
@@ -139,27 +156,66 @@ def model_log(name: str) -> Path:
 def read_state() -> dict:
     try:
         with open(state_file()) as f:
-            return json.load(f)
-    except Exception:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {"state": "idle"}
+    except FileNotFoundError:
         return {"state": "idle"}
+    except (OSError, ValueError):
+        return {"state": "idle", "_corrupt": True}
+
+
+@contextmanager
+def file_lock(name: str):
+    """Blocking exclusive flock on cache/<name> (released by the kernel if the
+    holder dies). Serialises read-modify-write of the small JSON files that the
+    gateway, the CLI, the runner and the watcher all update."""
+    fd = os.open(str(cache_dir() / name), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _atomic_json(path: Path, data) -> None:
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def update_state(fn) -> dict:
+    """Locked read-modify-write: fn(state) mutates the dict in place. A state
+    file that does not parse is kept aside (state.json.corrupt) instead of
+    being silently replaced by a blank one."""
+    with file_lock("state.lock"):
+        st = read_state()
+        if st.pop("_corrupt", False):
+            try:
+                os.replace(state_file(), state_file().with_name("state.json.corrupt"))
+            except OSError:
+                pass
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] state.json did not parse; "
+                  "kept as state.json.corrupt", file=sys.stderr, flush=True)
+        fn(st)
+        st["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        _atomic_json(state_file(), st)
+        return st
 
 
 def write_state(s: dict) -> None:
-    """Read-modify-write merge, atomic replace, per-writer temp name.
-
-    The merge keeps fields written by other parties alive across this writer's
-    progress updates (C3: a full replace dropped runner_pid mid-swap and let a
-    second runner in). The unique temp name stops two writers (gateway +
-    runner) interleaving on one shared .tmp (M4).
-    """
-    s = dict(s)
-    s["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    st = read_state()
-    st.update(s)
-    tmp = state_file().with_name(f"state.{os.getpid()}.{time.time_ns()}.tmp")
-    with open(tmp, "w") as f:
-        json.dump(st, f, indent=2)
-    os.replace(tmp, state_file())
+    """Merge `s` into the state (locked read-modify-write, atomic replace), so
+    fields written by other parties - runner_pid, server, failures - survive."""
+    update_state(lambda st: st.update(s))
 
 
 @contextmanager
@@ -206,23 +262,41 @@ def _run(cmd: list[str], timeout: float = 10.0, env: dict | None = None):
         return None
 
 
-def _proc_stat(pid: int) -> list[str]:
+def _proc_stat(pid) -> list[str]:
     """Fields of /proc/<pid>/stat after the command name: [state, ppid, ...]."""
     try:
         raw = Path(f"/proc/{int(pid)}/stat").read_text()
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return []
     return raw.rsplit(")", 1)[-1].split()
 
 
-def _pid_alive(pid) -> bool:
-    """True for a live process. A zombie counts as dead: the runner is a child
-    of the gateway that nobody reaps, and os.kill(pid, 0) succeeds on zombies,
-    which kept a crashed runner 'alive' and the state machine busy forever."""
-    if not pid:
+def proc_start(pid) -> int | None:
+    """Start time of a process (clock ticks since boot), to tell a recycled pid
+    from the process we recorded."""
+    stat = _proc_stat(pid)
+    try:
+        return int(stat[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _pid_alive(pid, start=None) -> bool:
+    """True for a live process. A zombie counts as dead (a long-lived parent may
+    not have reaped it yet). With `start`, the process must also be the one
+    recorded then (not a recycled pid)."""
+    try:
+        if int(pid) <= 0:
+            return False
+    except (TypeError, ValueError):
         return False
     stat = _proc_stat(pid)
-    return bool(stat) and stat[0] != "Z"
+    if not stat or stat[0] in ("Z", "X"):
+        return False
+    if start:
+        cur = proc_start(pid)
+        return cur is None or int(start) == cur
+    return True
 
 
 def _proc_argv(pid: int) -> list[str]:
@@ -246,8 +320,13 @@ def _proc_cgroup(pid: int) -> str:
 
 
 def runner_alive(st: dict) -> bool:
+    """The runner of this state is running. A runner spawned less than
+    SPAWN_GRACE_S ago that has not registered its pid yet counts as alive."""
+    pid = st.get("runner_pid")
+    if pid:
+        return _pid_alive(pid, st.get("runner_start"))
     try:
-        return _pid_alive(int(st.get("runner_pid") or 0))
+        return time.time() - float(st.get("spawned_at") or 0) < SPAWN_GRACE_S
     except (TypeError, ValueError):
         return False
 
@@ -257,6 +336,15 @@ def busy_state() -> str | None:
     st = read_state()
     if st.get("state") in BUSY_STATES and runner_alive(st):
         return st.get("state")
+    return None
+
+
+def runner_died_midflight(st: dict | None = None) -> dict | None:
+    """The state says a swap/restore/start is in flight but its runner is gone
+    (killed with whatever spawned it, OOM, ...): {action, target} to relaunch."""
+    st = read_state() if st is None else st
+    if st.get("state") in BUSY_STATES and not runner_alive(st):
+        return {"action": st.get("action"), "target": st.get("target"), "state": st.get("state")}
     return None
 
 
@@ -673,29 +761,103 @@ def sync_ctx(models: list, source: dict, original_name: str | None = None) -> di
 
 # ------------------------------------------------------- process isolation
 
+_SYSTEMD_CACHE: dict = {}
+
+
 def _user_systemd() -> bool:
-    """Can we create transient user scopes (systemd-run --user --scope)?"""
-    if not (shutil.which("systemctl") and shutil.which("systemd-run")):
-        return False
-    r = _run(["systemctl", "--user", "show", "-p", "Version"], timeout=5)
-    return bool(r and r.returncode == 0)
+    """Can we create transient user units (systemd-run --user)? Cached per process."""
+    if "ok" not in _SYSTEMD_CACHE:
+        ok = bool(shutil.which("systemctl") and shutil.which("systemd-run"))
+        if ok:
+            r = _run(["systemctl", "--user", "show", "-p", "Version"], timeout=5)
+            ok = bool(r and r.returncode == 0)
+        _SYSTEMD_CACHE["ok"] = ok
+    return _SYSTEMD_CACHE["ok"]
+
+
+def _isolated() -> bool:
+    return bool(get_cfg().get("isolate_scope", True)) and _user_systemd()
+
+
+def _unit_name(prefix: str, name: str, kind: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-") or "x"
+    return f"{prefix}{safe}-{time.time_ns() // 1000}.{kind}"
 
 
 def _scoped(cmd: list[str], prefix: str, name: str) -> tuple[list[str], str | None]:
     """Optionally run cmd in its own cgroup (transient user scope).
 
-    This is NOT a service: nothing starts or stops through systemd. It only
-    moves the process out of the cgroup of whoever spawned it - the gateway
-    service - so a gateway restart (KillMode=control-group) does not take the
-    runner or the loaded model with it. Off (isolate_scope: false) or without
-    a user systemd, the process just gets its own session (setsid).
+    Used for the engine process. It is NOT a service: nothing starts or stops
+    through systemd. It only moves the process out of the cgroup of whoever
+    spawned it, so neither a gateway restart (KillMode=control-group) nor the
+    end of the runner's own service unit takes the loaded model with it. Off
+    (isolate_scope: false) or without a user systemd, the process just gets
+    its own session (setsid).
     """
-    if not get_cfg().get("isolate_scope", True) or not _user_systemd():
+    if not _isolated():
         return cmd, None
-    safe = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-") or "x"
-    unit = f"{prefix}{safe}-{int(time.time())}.scope"
+    unit = _unit_name(prefix, name, "scope")
     return (["systemd-run", "--user", "--scope", "--quiet", "--collect",
              "--unit", unit, "--"] + cmd, unit)
+
+
+# Fresh, single-threaded interpreter that double-forks: the grandchild runs the
+# command in its own session and is re-parented to the subreaper / init, so it
+# is no longer a descendant of the caller when the intermediate exits.
+_DOUBLE_FORK = r"""
+import os, sys
+log, cwd, argv = sys.argv[1], sys.argv[2], sys.argv[3:]
+r, w = os.pipe()
+if os.fork() == 0:
+    os.setsid()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        nul = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(nul, 0); os.dup2(fd, 1); os.dup2(fd, 2)
+        os.chdir(cwd)
+        os.execvp(argv[0], argv)
+    os.write(w, str(pid).encode())
+    os._exit(0)
+os.close(w)
+os.wait()
+print(os.read(r, 32).decode() or "0")
+"""
+
+
+def _detached(cmd: list[str], prefix: str, name: str, log_path: Path) -> dict:
+    """Start a long-lived helper (runner, watcher) that is NOT a descendant of
+    the caller: killing the caller's process tree - a terminal tool timing out
+    on `hermes sms ... --wait`, a gpu_job.sh killed by its host - must never take
+    a model load with it.
+
+    With a user systemd: a transient *service* (its parent is systemd), output
+    appended to log_path. Otherwise: a double fork. Returns {pid, unit}; the
+    pid may be None for a service (the helper registers its own pid).
+    """
+    env = child_env()
+    if _isolated():
+        unit = _unit_name(prefix, name, "service")
+        sd = ["systemd-run", "--user", "--quiet", "--collect", "--unit", unit,
+              f"--working-directory={PLUGIN_DIR}",
+              "-p", f"StandardOutput=append:{log_path}", "-p", f"StandardError=append:{log_path}"]
+        sd += [f"--setenv={k}={v}" for k, v in sorted(env.items())]
+        r = _run(sd + ["--"] + cmd, timeout=20, env=env)
+        if r is not None and r.returncode == 0:
+            pid = None
+            q = _run(["systemctl", "--user", "show", "-p", "MainPID", "--value", unit], timeout=5)
+            if q is not None and q.stdout.strip().isdigit() and int(q.stdout.strip()) > 0:
+                pid = int(q.stdout.strip())
+            return {"pid": pid, "unit": unit}
+    r = subprocess.run([sys.executable, "-c", _DOUBLE_FORK, str(log_path), str(PLUGIN_DIR)] + cmd,
+                       capture_output=True, text=True, timeout=20, env=env,
+                       stdin=subprocess.DEVNULL)
+    try:
+        pid = int((r.stdout or "0").strip().splitlines()[-1]) or None
+    except (ValueError, IndexError):
+        pid = None
+    return {"pid": pid, "unit": None}
 
 
 # ---------------------------------------------------------- server detection
@@ -721,6 +883,7 @@ def _listener_pid(port: int, data: dict | None = None) -> int | None:
             m = re.search(r"pid=(\d+)", r.stdout)
             if m:
                 return int(m.group(1))
+    data = load_models() if data is None else data  # once, not once per /proc entry
     for p in Path("/proc").iterdir():
         if not p.name.isdigit():
             continue
@@ -763,6 +926,7 @@ def detect_servers(data: dict | None = None) -> list[dict]:
     Sources: the listener on the engine's port, and whatever SMP started last
     (may still be loading, so not listening yet).
     """
+    data = load_models() if data is None else data
     found: list[dict] = []
 
     def add(info: dict) -> None:
@@ -867,15 +1031,6 @@ def stop_server() -> dict:
     write_state({"server": None})
     actions.append("VRAM settled" if settle_vram() else "VRAM settle timeout (proceeding)")
     return {"ok": True, "actions": actions}
-
-
-def stop_llm() -> list[str]:
-    """Back-compat wrapper around stop_server(): list of action strings."""
-    res = stop_server()
-    out = list(res.get("actions", []))
-    if not res.get("ok"):
-        out.append("ERROR: " + str(res.get("error")))
-    return out
 
 
 # --------------------------------------------------------------------- vram
@@ -1007,25 +1162,52 @@ def drain_requests(log=print) -> None:
     cfg = get_cfg()
     stall = int(cfg.get("drain_timeout_s") or 0)
     cap = max(stall, int(cfg.get("drain_max_s") or 0))
+    # A turn is a chain of requests with short gaps (tool calls, Hermes' own
+    # follow-up calls): one idle read is not "the turn ended". The engine must
+    # stay idle for drain_quiet_s in a row.
+    quiet = max(0.0, float(cfg.get("drain_quiet_s") or 0))
     n = requests_processing()
-    if n is None or n <= 0 or stall <= 0:
+    if n is None or stall <= 0 or (n <= 0 and quiet <= 0):
         return
-    log(f"draining {n} in-flight request(s) (cut after {stall}s without progress, max {cap}s)")
+    announce = f"(cut after {stall}s without progress, max {cap}s)"
+    announced = n > 0
+    if announced:
+        log(f"draining {n} in-flight request(s) {announce}")
     t0 = last_move = time.time()
+    quiet_since = None if n > 0 else t0
     last = llm_activity()
-    idle = 0
+    blind = 0
     while True:
         now = time.time()
         n = requests_processing()
-        idle = idle + 1 if (n is None or n <= 0) else 0
-        if idle >= 2:  # two consecutive idle reads: the turn really ended
-            log(f"drained in {int(now - t0)}s")
-            return
+        if n is None:
+            # One failed read can be a busy engine; three in a row means it is
+            # gone and there is nothing left to protect.
+            blind += 1
+            if blind >= 3:
+                if announced:
+                    log("drain: the engine stopped answering")
+                return
+            time.sleep(1)
+            continue
+        blind = 0
+        if n <= 0:
+            quiet_since = now if quiet_since is None else quiet_since
+            if now - quiet_since >= max(quiet, 1.0):
+                if announced:
+                    log(f"drained in {int(now - t0)}s")
+                return
+        else:
+            quiet_since = None
+            if not announced:
+                log(f"a request started during the quiet window: draining {n} in-flight request(s) {announce}")
+                announced = True
+                last_move = now
         c = llm_activity()
         if c is not None and last is not None and c != last:
             last_move = now
         last = c if c is not None else last
-        if now - last_move >= stall:
+        if n > 0 and now - last_move >= stall:
             log(f"drain: no progress for {stall}s - cutting with {n} request(s) in flight")
             return
         if now - t0 >= cap:
@@ -1062,24 +1244,6 @@ def gpu_job_marker() -> Path:
     return cache_dir() / "gpu_job.active"
 
 
-def _pid_alive(pid) -> bool:
-    """Running (a zombie counts as dead: a long-lived parent such as the
-    gateway may not have reaped an exited watcher yet)."""
-    try:
-        pid = int(pid)
-        if pid <= 0:
-            return False
-        os.kill(pid, 0)
-    except (OSError, ValueError, TypeError):
-        return False
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            state = f.read().rsplit(")", 1)[1].split()[0]
-        return state not in ("Z", "X")
-    except (OSError, IndexError):
-        return True
-
-
 def gpu_job_active() -> bool:
     try:
         return _pid_alive(gpu_job_marker().read_text().split()[0])
@@ -1092,12 +1256,14 @@ def gpu_job_info() -> dict | None:
     mode is 'none' (LLM unloaded for the job) or the model kept during it."""
     try:
         marker = gpu_job_marker()
-        pid = int(marker.read_text().split()[0])
+        fields = marker.read_text().split()
+        pid = int(fields[0])
         if not _pid_alive(pid):
             return None
         since = marker.stat().st_mtime
     except (OSError, IndexError, ValueError):
         return None
+    applied = fields[1] if len(fields) > 1 else ""  # none | keep | the model kept (gpu_job.sh)
     argv = _proc_argv(pid)
     mode, job = "", ""
     for i, a in enumerate(argv):
@@ -1108,6 +1274,8 @@ def gpu_job_info() -> dict | None:
                 rest = rest[1:]
             job = " ".join(os.path.basename(x) if "/" in x else x for x in rest)[:120]
             break
+    if applied and applied not in GPU_JOB_MODES[:1]:  # not the unresolved "auto"
+        mode = applied
     return {"pid": pid, "mode": mode, "job": job,
             "since": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(since)),
             "elapsed_s": int(time.time() - since)}
@@ -1117,12 +1285,35 @@ def idle_watch_file() -> Path:
     return cache_dir() / "idle_watch.json"
 
 
+def watch_lock(timeout_s: float = 0.0) -> int | None:
+    """Take the watcher singleton lock (idle_watch.lock), polling up to
+    timeout_s. Returns the fd to keep open for the watcher's lifetime, or None
+    when another watcher holds it. The kernel drops it if the watcher dies."""
+    fd = os.open(str(cache_dir() / "idle_watch.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.time() + max(0.0, timeout_s)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.5)
+
+
 def idle_watch_status() -> dict | None:
+    """The running watcher ({pid, target, ...}), or None. Alive = it holds the
+    singleton lock (no pid-file race, no recycled pid)."""
+    fd = watch_lock(0.0)
+    if fd is not None:
+        os.close(fd)  # nobody holds it
+        return None
     try:
         info = json.loads(idle_watch_file().read_text())
+        return info if isinstance(info, dict) else {}
     except (OSError, ValueError):
-        return None
-    return info if _pid_alive(info.get("pid")) else None
+        return {"pid": None}
 
 
 FAILURE_WINDOW_S = 30 * 60
@@ -1131,9 +1322,14 @@ FAILURE_WINDOW_S = 30 * 60
 def note_failure(name: str, why: str = "") -> None:
     """Remember that `name` failed to load or died, so the automatic fallbacks
     do not pick it again for a while (no crash loops). Explicit swaps ignore it."""
-    hist = [f for f in (read_state().get("failures") or []) if isinstance(f, dict)]
-    hist.append({"model": name, "at": time.time(), "why": str(why)[:200]})
-    write_state({"failures": hist[-10:]})
+    now = time.time()
+
+    def add(st: dict) -> None:
+        hist = [f for f in (st.get("failures") or [])
+                if isinstance(f, dict) and now - float(f.get("at") or 0) <= FAILURE_WINDOW_S]
+        hist.append({"model": name, "at": now, "why": str(why)[:200]})
+        st["failures"] = hist[-10:]
+    update_state(add)
 
 
 def recent_failures(window_s: float = FAILURE_WINDOW_S) -> set:
@@ -1146,7 +1342,22 @@ def crashed_model() -> str | None:
     """Name of the model whose server died on its own: the state still records
     a running server (a deliberate stop clears it) but its process is gone."""
     srv = read_state().get("server") or {}
-    if srv.get("model") and srv.get("pid") and not _pid_alive(srv.get("pid")):
+    if srv.get("model") and srv.get("pid") and not _pid_alive(srv.get("pid"), srv.get("start")):
+        return str(srv["model"])
+    return None
+
+
+def stopped_by_signal(name: str) -> bool:
+    """True when the engine log of `name` ends with a clean shutdown: the server
+    was told to stop (SIGINT/SIGTERM from outside SMP), it did not crash."""
+    return any("cleaning up before exit" in ln for ln in _log_tail(model_log(name), 4))
+
+
+def server_unresponsive() -> str | None:
+    """Name of the model whose server process is alive but does not answer
+    (overloaded host, hung engine). Not the same as stopped or crashed."""
+    srv = read_state().get("server") or {}
+    if srv.get("model") and srv.get("pid") and _pid_alive(srv.get("pid"), srv.get("start")):
         return str(srv["model"])
     return None
 
@@ -1177,13 +1388,10 @@ def spawn_idle_watch(target: str) -> dict:
     if cur:
         return {"ok": True, "skipped": f"watcher already running (pid {cur.get('pid')})"}
     b64 = base64.b64encode(json.dumps(cfg).encode()).decode()
-    cmd, scope = _scoped(
-        [sys.executable, str(PLUGIN_DIR / "runner.py"), str(state_file()), "idle_watch", target, b64],
-        RUNNER_SCOPE_PREFIX, "idle")
-    with open(log_file(), "ab") as lf:
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                start_new_session=True, cwd=str(PLUGIN_DIR), env=child_env())
-    return {"ok": True, "pid": proc.pid, "scope": scope, "target": target}
+    rotate_log(log_file())
+    out = _detached([sys.executable, str(PLUGIN_DIR / "runner.py"), str(state_file()),
+                     "idle_watch", target, b64], RUNNER_SCOPE_PREFIX, "idle", log_file())
+    return {"ok": True, "pid": out["pid"], "unit": out["unit"], "target": target}
 
 
 def ensure_idle_watch() -> dict:
@@ -1223,8 +1431,11 @@ def comfy_status(max_age: float = 0.0) -> dict:
 
 
 def _comfy_probe(cfg: dict) -> dict:
+    """{up, vram, running, pending, busy}. busy = its queue has work; an open
+    but idle ComfyUI is not GPU work (it may still cache models in VRAM)."""
+    base = cfg["comfy_url"].rstrip("/")
     try:
-        with urllib.request.urlopen(cfg["comfy_url"].rstrip("/") + "/system_stats", timeout=2) as r:
+        with urllib.request.urlopen(base + "/system_stats", timeout=2) as r:
             data = json.load(r)
         gib = 1024 ** 3
         vram = []
@@ -1237,9 +1448,35 @@ def _comfy_probe(cfg: dict) -> dict:
             if "torch_vram_total" in d:
                 item["held_gib"] = round(d.get("torch_vram_total", 0) / gib, 1)
             vram.append(item)
-        return {"up": True, "vram": vram}
-    except Exception:
-        return {"up": False, "vram": []}
+    except Exception:  # noqa: BLE001
+        return {"up": False, "vram": [], "running": 0, "pending": 0, "busy": False}
+    running = pending = 0
+    queue_known = False
+    try:
+        with urllib.request.urlopen(base + "/queue", timeout=2) as r:
+            q = json.load(r)
+        running, pending = len(q.get("queue_running") or []), len(q.get("queue_pending") or [])
+        queue_known = True
+    except Exception:  # noqa: BLE001 - unknown queue: assume it works (safe side)
+        pass
+    return {"up": True, "vram": vram, "running": running, "pending": pending,
+            "busy": (running + pending) > 0 or not queue_known}
+
+
+def comfy_free() -> dict:
+    """Ask an idle ComfyUI to unload its models and release cached VRAM
+    (POST /free). The process keeps running; nothing is killed."""
+    url = get_cfg()["comfy_url"].rstrip("/") + "/free"
+    body = json.dumps({"unload_models": True, "free_memory": True}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            ok = 200 <= r.status < 300
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    _comfy_cache["data"] = None
+    return {"ok": ok}
 
 
 def comfy_retained_gb(comfy: dict | None = None) -> float:
@@ -1277,8 +1514,10 @@ def vram_budget(vram: list[dict] | None = None) -> dict:
             "method": "total - ComfyUI reservation (per-process usage unavailable)"}
 
 
-def vram_available_for_swap() -> float:
-    return vram_budget()["gb"]
+def comfy_busy(max_age: float = 5.0) -> bool:
+    """ComfyUI is up AND has work queued or running."""
+    c = comfy_status(max_age=max_age)
+    return bool(c.get("up") and c.get("busy"))
 
 
 # ------------------------------------------------- release gate (per GPU)
@@ -1336,20 +1575,18 @@ def record_vram_profile(name: str, before: list[dict], after: list[dict], pin=No
     floor = 0.5 * float(entry.get("min_free_vram_gb", 0)) * 1024
     if not per or sum(per.values()) < max(512.0, floor):
         return None
-    prof = load_vram_profile()
-    old = prof.get(key) or {}
-    hist = [h for h in (old.get("history") or []) if isinstance(h, dict) and h.get("per_gpu_mib")]
     ctx = model_ctx(entry) if entry else None
-    hist.append({"per_gpu_mib": per, "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "ctx": ctx})
-    hist = hist[-5:]
     on = {int(pin)} if pin is not None else (
         layout_gpus(entry, [g["gpu"] for g in after or []]) if entry else None)
-    med = _profile_median(hist, ctx, on) or per
-    prof[key] = {"per_gpu_mib": med, "at": hist[-1]["at"], "ctx": ctx, "history": hist}
-    p = vram_profile_file()
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(prof, indent=2))
-    os.replace(tmp, p)
+    with file_lock("vram_profile.lock"):
+        prof = load_vram_profile()
+        old = prof.get(key) or {}
+        hist = [h for h in (old.get("history") or []) if isinstance(h, dict) and h.get("per_gpu_mib")]
+        hist.append({"per_gpu_mib": per, "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "ctx": ctx})
+        hist = hist[-5:]
+        med = _profile_median(hist, ctx, on) or per
+        prof[key] = {"per_gpu_mib": med, "at": hist[-1]["at"], "ctx": ctx, "history": hist}
+        _atomic_json(vram_profile_file(), prof)
     try:
         _raise_declared_min(name, sum(med.values()) / 1024.0)
     except Exception:  # noqa: BLE001 - the profile is what matters; the registry is cosmetic
@@ -1474,11 +1711,12 @@ def gpu_holders(exclude_pids: list[int] | None = None) -> list[dict]:
     reports them, compute processes that are not the LLM server."""
     exclude = set(exclude_pids if exclude_pids is not None else llm_server_pids())
     out: list[dict] = []
-    comfy = comfy_status()
+    comfy = comfy_status(max_age=5.0)
     comfy_item = None
     if comfy.get("up"):
         comfy_item = {"kind": "comfyui", "name": "ComfyUI", "url": get_cfg()["comfy_url"],
-                      "held_gib": comfy_retained_gb(comfy)}
+                      "held_gib": comfy_retained_gb(comfy), "busy": bool(comfy.get("busy")),
+                      "running": comfy.get("running", 0), "pending": comfy.get("pending", 0)}
         out.append(comfy_item)
     exe = nvidia_smi_path()
     if not exe:
@@ -1524,6 +1762,13 @@ def check_release(name: str, wait_s: float = 0.0, poll_s: float = 5.0) -> dict:
         return {"ok": False, "error": f"unknown model '{name}'", "available": available_models()}
     deadline = time.time() + max(0.0, wait_s)
     while True:
+        busy = busy_state()
+        if busy:  # mid-swap the VRAM numbers mean nothing: wait for it to end
+            if time.time() >= deadline:
+                return {"ok": False, "busy": busy, "model": entry["name"],
+                        "summary": f"a swap is in flight ({busy}); VRAM not measured"}
+            time.sleep(poll_s)
+            continue
         current = match_model(llm_health(timeout=1.5))
         if current == entry["name"]:
             return {"ok": True, "model": entry["name"], "summary": f"'{current}' is already loaded"}
@@ -1536,7 +1781,9 @@ def check_release(name: str, wait_s: float = 0.0, poll_s: float = 5.0) -> dict:
 
 def describe_holder(h: dict) -> str:
     if h.get("kind") == "comfyui":
-        return f"ComfyUI ({h.get('url')}, holds ~{h.get('held_gib', 0)} GiB" + (
+        what = (f"working: {h.get('running', 0)} running, {h.get('pending', 0)} queued"
+                if h.get("busy") else "idle")
+        return f"ComfyUI ({h.get('url')}, {what}, holds ~{h.get('held_gib', 0)} GiB" + (
             f", pid {h['pid']})" if h.get("pid") else ")")
     return f"pid {h.get('pid')} on GPU{h.get('gpus') or '?'}: {h.get('cmd')}"
 
@@ -1602,7 +1849,38 @@ def launch_args(entry: dict, data: dict | None = None) -> list[str]:
         clean, _ = normalize_params({k: v for k, v in entry["presets"][name].items()
                                      if k in PARAM_RANGES})
         args = apply_params_to_args(args, clean)
-    return eng.finalize_args(ecfg, entry, args)
+    return eng.finalize_args(ecfg, entry, dedupe_switches(args))
+
+
+def dedupe_switches(args: list[str]) -> list[str]:
+    """Drop a repeated value-less switch (`--metrics` in the engine's
+    common_args and again in the model's args): engines warn about it. Options
+    that take a value are left alone, repeated or not."""
+    is_flag = smp_cmdline.is_flag
+    out: list[str] = []
+    seen: set = set()
+    for i, tok in enumerate(args):
+        bare = is_flag(tok) and (i + 1 == len(args) or is_flag(args[i + 1]))
+        if bare:
+            if tok in seen:
+                continue
+            seen.add(tok)
+        out.append(tok)
+    return out
+
+
+LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def rotate_log(path: Path, max_bytes: int = LOG_MAX_BYTES) -> None:
+    """Keep one previous generation (`<name>.1`) once a log passes max_bytes.
+    Called right before a log is opened for a new run; a process that still
+    writes to the old file keeps its handle."""
+    try:
+        if path.stat().st_size > max_bytes:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
 
 
 def build_cmd(entry: dict, data: dict | None = None) -> list[str]:
@@ -1634,6 +1912,7 @@ def start_model(entry: dict) -> dict:
         return {"ok": False, "started_by": "smp", "error": str(e)}
     cmd, scope = _scoped(argv, LLM_SCOPE_PREFIX, name)
     logf = model_log(name)
+    rotate_log(logf)
     vram_before = get_vram()
     with open(logf, "ab") as lf:
         lf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} start {name} =====\n"
@@ -1644,7 +1923,8 @@ def start_model(entry: dict) -> dict:
                                 cwd=os.path.dirname(argv[0]) or None,
                                 start_new_session=True)
     write_state({"server": {"mode": "smp", "engine": eng.id, "unit": scope,
-                            "pid": proc.pid, "model": name, "pin_gpu": entry.get("pin_gpu")}})
+                            "pid": proc.pid, "start": proc_start(proc.pid),
+                            "model": name, "pin_gpu": entry.get("pin_gpu")}})
     res = wait_health(entry, "scope" if scope else "session", proc=proc)
     if res.get("ok"):
         try:
@@ -1786,24 +2066,31 @@ def spawn_runner(action: str, target: str, grace: int | None = None, pin=None) -
         "grace_until": time.time() + grace,
         "pin_gpu": None if pin is None else int(pin),
         "runner_pid": None,
+        "runner_start": None,
+        "runner_unit": None,
+        "spawned_at": time.time(),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
-    cmd, scope = _scoped(
-        [sys.executable, str(PLUGIN_DIR / "runner.py"), str(state_file()), action, target, b64],
-        RUNNER_SCOPE_PREFIX, action)
+    rotate_log(log_file())
     with open(log_file(), "ab") as lf:
         lf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} spawn {action} {target} =====\n".encode())
-        lf.flush()
-        proc = subprocess.Popen(
-            cmd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            start_new_session=True, cwd=str(PLUGIN_DIR), env=child_env(),
-        )
-    write_state({"runner_pid": proc.pid})
+    try:
+        out = _detached([sys.executable, str(PLUGIN_DIR / "runner.py"), str(state_file()),
+                         action, target, b64], RUNNER_SCOPE_PREFIX, action, log_file())
+    except Exception as e:  # noqa: BLE001 - never leave a phantom "grace" behind
+        write_state({"state": "failed", "spawned_at": None,
+                     "last_result": {"action": action, "target": target, "ok": False,
+                                     "error": f"could not start the runner: {type(e).__name__}: {e}",
+                                     "at": time.strftime("%Y-%m-%dT%H:%M:%S")}})
+        return {"ok": False, "error": f"could not start the runner: {type(e).__name__}: {e}"}
+    write_state({"runner_unit": out["unit"]})
     note = ("Loading in the background." if action == "start" else
             f"Model will be cut in ~{grace}s (after in-flight requests drain) "
             "and loaded in the background. Finish the current turn.")
     return {"ok": True, "state": "starting" if action == "start" else "grace", "grace_s": grace,
-            "target": target, "runner_pid": proc.pid, "runner_scope": scope, "note": note}
+            "target": target, "runner_pid": out["pid"], "runner_unit": out["unit"],
+            "budget_s": swap_budget_s(find_model(target) if action == "swap" else None),
+            "note": note}
 
 
 def autostart_primary(replace: bool = False) -> dict:
@@ -1845,7 +2132,7 @@ def autostart_primary(replace: bool = False) -> dict:
     current = match_model(llm_health(timeout=2.0))
     if not replace or not current or same_name(current, name):
         return {"ok": True, "skipped": "already running: " + running}
-    if gpu_job_active() or any(h.get("kind") == "comfyui" for h in gpu_holders()):
+    if gpu_job_active() or comfy_busy():
         return {"ok": True, "skipped": f"'{current}' is serving and a GPU job / ComfyUI is running: "
                                        "the primary comes back through the idle restore"}
     out = json.loads(h_restore({}))  # takes the swap lock itself
@@ -1873,13 +2160,14 @@ def swap_view(st: dict | None = None) -> dict:
     st = read_state() if st is None else st
     state = st.get("state", "idle")
     alive = runner_alive(st)
-    stale = state in BUSY_STATES and not alive and st.get("runner_pid") is not None
+    stale = state in BUSY_STATES and not alive
     return {
         "state": "failed" if stale else state,
         "stale": stale,
         "action": st.get("action"),
         "target": st.get("target"),
         "runner_pid": st.get("runner_pid"),
+        "runner_unit": st.get("runner_unit"),
         "runner_alive": alive,
         "grace_until": st.get("grace_until"),
         "updated_at": st.get("updated_at"),
@@ -1920,6 +2208,12 @@ def h_status(args: dict, **kwargs) -> str:
             "comfyui": comfy,
             "gpu_holders": [describe_holder(h) for h in gpu_holders()],
             "gpu_job": gpu_job_info(),
+            "watcher": idle_watch_status(),
+            "failures": [{"model": f.get("model"), "why": f.get("why"),
+                          "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(float(f.get("at") or 0)))}
+                         for f in (read_state().get("failures") or [])
+                         if isinstance(f, dict) and time.time() - float(f.get("at") or 0) <= FAILURE_WINDOW_S],
+            "swap_budget_s": swap_budget_s(),
             "primary_model": cfg["primary_model"],
             "models": models,
         })
@@ -2046,38 +2340,66 @@ def _launch(action: str, entry: dict, dry: bool, extra: dict, force: bool = Fals
         return jdump({"ok": False, "error": "preflight failed", "model": name, "preflight": pf})
     with swap_lock() as got:  # C3+M4: serialize check+spawn; the runner holds it
         if not got:
-            return jdump({"ok": False,
+            return jdump({"ok": False, "busy": True,
                           "error": "another swap/restore holds the lock; retry in a few seconds"})
         busy = busy_state()
         if busy:
-            return jdump({"ok": False, "error": f"swap already in progress (state: {busy})"})
+            return jdump({"ok": False, "busy": True, "error": f"swap already in progress (state: {busy})"})
         # Nothing is serving: there is no reply to protect, so skip the grace.
         grace = None if llm_health(timeout=2.0).get("up") else 0
         return jdump(spawn_runner(action, name, grace, pin))
 
 
-def wait_idle(timeout_s: float = 900.0, target: str | None = None, poll_s: float = 3.0) -> dict:
+def swap_budget_s(entry: dict | None = None) -> int:
+    """Worst-case seconds one swap/restore to `entry` (default: the primary)
+    can take: grace + drain cap + stop (SIGINT wait, SIGKILL, port release) +
+    VRAM settle + release gate + the model's load timeout + a margin. Used as
+    the default for every --wait / --timeout so a wait never gives up on a
+    swap that is still legitimately running."""
+    cfg = get_cfg()
+    entry = entry or find_model(str(cfg.get("primary_model") or "")) or {}
+
+    def num(v, default):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float(default)
+    return int(num(cfg.get("grace_s"), 10) + num(cfg.get("drain_max_s"), 600) + 45
+               + num(cfg.get("vram_settle_timeout_s"), 90) + num(cfg.get("release_wait_s"), 120)
+               + num(entry.get("load_timeout_s"), 120) + 60)
+
+
+def wait_idle(timeout_s: float | None = None, target: str | None = None, poll_s: float = 3.0,
+              since: str | None = None) -> dict:
     """Block until no swap/restore/start is in flight, then report the outcome.
 
-    For scripts and the agent's terminal (`hermes sms swap X --wait`): the
-    tool handlers return as soon as the runner is spawned, this waits for it.
-    ok = the last result succeeded and the engine serves a registered model
-    (and that model is `target`, when given).
+    For scripts (`hermes sms swap X --wait`, gpu_job.sh): the tool handlers
+    return as soon as the runner is spawned, this waits for it. ok = the last
+    result succeeded and the engine serves a registered model (and that model
+    is `target`, when given). timeout_s None/0 = swap_budget_s(target).
+    since: ISO time of the launch; an older last_result is not this run's.
     """
-    import time as _time
-    t0 = _time.monotonic()
+    if not timeout_s:
+        timeout_s = swap_budget_s(find_model(target) if target else None)
+    t0 = time.monotonic()
     while busy_state():
-        if _time.monotonic() - t0 > timeout_s:
+        if time.monotonic() - t0 > timeout_s:
             st = read_state()
-            return {"ok": False, "error": f"timeout after {int(timeout_s)}s",
+            return {"ok": False, "error": f"timeout after {int(timeout_s)}s (the swap goes on in "
+                                          "the background; `hermes sms wait` waits for it again)",
                     "state": st.get("state"), "target": st.get("target")}
-        _time.sleep(poll_s)
+        time.sleep(poll_s)
     st = read_state()
     lr = st.get("last_result") or {}
+    stale = bool(since) and str(lr.get("at") or "") < str(since)
     current = match_model(llm_health(timeout=3.0))
-    ok = bool(lr.get("ok")) and current is not None and (target is None or same_name(current, target))
-    out = {"ok": ok, "current": current, "waited_s": int(_time.monotonic() - t0),
+    ok = (bool(lr.get("ok")) and not stale and current is not None
+          and (target is None or same_name(current, target)))
+    out = {"ok": ok, "current": current, "waited_s": int(time.monotonic() - t0),
            "last_result": lr}
+    if stale:
+        out["error"] = "the runner ended without reporting a result (killed?); see runner.log"
+        return out
     if not ok:
         out["error"] = (lr.get("error") or
                         (f"loaded '{current}', expected '{target}'" if current else "no model is serving"))
@@ -2171,7 +2493,7 @@ def after_job_policy() -> str:
     return v if v in ("small", "primary") else "small"
 
 
-def after_job(prefer: str | None = None, timeout_s: float = 900.0) -> dict:
+def after_job(prefer: str | None = None, timeout_s: float | None = None) -> dict:
     """What gpu_job.sh runs when the GPU job ends: make sure the agent has a
     brain to deliver the result with.
 
@@ -2189,12 +2511,23 @@ def after_job(prefer: str | None = None, timeout_s: float = 900.0) -> dict:
     primary = str(cfg.get("primary_model") or "")
     policy = after_job_policy()
     out: dict = {"policy": policy}
+    if busy_state():
+        # a swap is still running (e.g. the job's own FREE step outlived its
+        # wait): never measure VRAM or launch in the middle of it
+        out["waited_for_swap"] = wait_idle(timeout_s)
     current = match_model(llm_health(timeout=3.0))
 
     def launch(name: str) -> dict:
-        res = json.loads(h_restore({}) if same_name(name, primary) else h_swap({"model": name}))
+        def go() -> dict:
+            return json.loads(h_restore({}) if same_name(name, primary) else h_swap({"model": name}))
+        res = go()
+        if res.get("busy"):  # another runner holds the lock: wait for it, then retry once
+            wait_idle(timeout_s)
+            if same_name(match_model(llm_health(timeout=3.0)), name):
+                return {"ok": True, "current": name}
+            res = go()
         if res.get("ok") and not res.get("skipped"):
-            res = wait_idle(timeout_s, name)
+            res = wait_idle(timeout_s, name, since=time.strftime("%Y-%m-%dT%H:%M:%S"))
         return res
 
     if policy == "primary" and not same_name(current, primary):
@@ -2285,13 +2618,14 @@ def cmd_swap(raw: str) -> str:
         try:
             need = float(parts[1]) if len(parts) > 1 else 0.0
         except ValueError:
-            return "Uso: /swap plan [gb]"
+            return smp_i18n.t("Uso: /swap plan [gb]", "Usage: /swap plan [gb]")
         return h_plan({"needed_free_gb": need})
     if parts[0] == "restore":
         return h_restore({"dry_run": "dry" in parts[1:]})
     if parts[0] == "swap":
         if len(parts) < 2:
-            return "Uso: /swap <modelo> [dry] · /swap restore [dry] · /swap plan [gb] · /swap status"
+            return smp_i18n.t("Uso: /swap <modelo> [dry] · /swap restore [dry] · /swap plan [gb] · /swap status",
+                              "Usage: /swap <model> [dry] · /swap restore [dry] · /swap plan [gb] · /swap status")
         return h_swap({"model": parts[1], "dry_run": "dry" in parts[2:]})
     # Assume the first token is a model name
     return h_swap({"model": parts[0], "dry_run": "dry" in parts[1:]})
@@ -2311,26 +2645,28 @@ def setup_sms(parser) -> None:
     p.add_argument("--force", action="store_true", help="Reload even if the model is already serving")
     p.add_argument("--gpu", type=int, default=None, help="Load the model whole on this GPU (nvidia-smi index), leaving the others free")
     p.add_argument("--wait", action="store_true", help="Block until the swap finishes; exit 0 only if the target is serving")
-    p.add_argument("--timeout", type=float, default=900, help="Max seconds for --wait (default 900)")
+    p.add_argument("--timeout", type=float, default=0,
+                   help="Max seconds for --wait (default: the worst case of this swap, from the settings)")
     p = sub.add_parser("restore", help="Restore the primary model (background, with grace)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true", help="Reload even if the model is already serving")
     p.add_argument("--wait", action="store_true", help="Block until the restore finishes; exit 0 only if the primary is serving")
-    p.add_argument("--timeout", type=float, default=900, help="Max seconds for --wait (default 900)")
+    p.add_argument("--timeout", type=float, default=0,
+                   help="Max seconds for --wait (default: the worst case of this swap, from the settings)")
     p = sub.add_parser("check", help="Release gate: may this model load now? (other GPU processes released, VRAM per GPU)")
     p.add_argument("model", nargs="?", default=None, help="Model to check (default: the primary)")
     p.add_argument("--wait", type=float, default=0, help="Poll up to N seconds until it passes")
     p = sub.add_parser("wait", help="Block until no swap/restore/start is in flight, then print the result")
-    p.add_argument("--timeout", type=float, default=900)
+    p.add_argument("--timeout", type=float, default=0, help="Max seconds (default: worst case of a swap)")
     p.add_argument("--target", default=None, help="Exit 0 only if this model is the one serving")
     p = sub.add_parser("job-layout", help="Where the LLM and a GPU job go: small model on one GPU + job on another (2+ GPUs), or no LLM (1 GPU); used by gpu_job.sh auto")
     p.add_argument("--task-gpu", type=int, default=None, help="GPU the job will use (default: the one with most room)")
     p.add_argument("--model", default=None, help="Model to keep during the job (default: the smallest)")
     p.add_argument("--mode", default=None, choices=list(GPU_JOB_MODES), help="Mode to apply (default: the gpu_job_mode setting chosen in the UI)")
-    p.add_argument("--plain", action="store_true", help="One line for scripts: <small|none|keep> <model|-> <llm_gpu|-> <task_gpu|-> <applied mode>")
+    p.add_argument("--plain", action="store_true", help="One line for scripts: <small|none|keep> <model|-> <llm_gpu|-> <task_gpu|-> <applied mode> <budget_s> <cache_dir> <comfy_url> <nvidia_smi|->")
     p = sub.add_parser("after-job", help="End of a GPU job: keep/load the model that will answer (setting after_gpu_job); used by gpu_job.sh")
     p.add_argument("--prefer", default=None, help="Model to load first if nothing is serving")
-    p.add_argument("--timeout", type=float, default=900)
+    p.add_argument("--timeout", type=float, default=0, help="Max seconds per wait (default: worst case of a swap)")
     sub.add_parser("start", help="Load the primary model now if nothing is serving (what the gateway does at start-up)")
     p = sub.add_parser("stop", help="Stop the model served by the active engine")
     p.add_argument("--graceful", action="store_true",
@@ -2358,25 +2694,35 @@ def cli_sms(args) -> int:
             out = h_restore({"dry_run": a.get("dry_run", False), "force": a.get("force", False)})
             target = get_cfg().get("primary_model")
         if a.get("wait") and not a.get("dry_run"):
+            timeout = float(a.get("timeout") or 0) or None
             launched = json.loads(out)
+            if launched.get("busy"):
+                # another swap is running: wait for it, then ask again once
+                print(out, flush=True)
+                wait_idle(timeout)
+                out = (h_swap({"model": a.get("model"), "force": a.get("force", False), "gpu": a.get("gpu")})
+                       if cmd == "swap" else h_restore({"force": a.get("force", False)}))
+                launched = json.loads(out)
             if launched.get("ok") and not launched.get("skipped"):
+                since = time.strftime("%Y-%m-%dT%H:%M:%S")
                 print(out, flush=True)  # the launch receipt, then the outcome
-                out = jdump({"action": cmd, **wait_idle(float(a.get("timeout") or 900), target)})
+                out = jdump({"action": cmd, **wait_idle(timeout, target, since=since)})
     elif cmd == "check":
         out = jdump(check_release(a.get("model") or get_cfg().get("primary_model"),
                                   float(a.get("wait") or 0)))
     elif cmd == "wait":
-        out = jdump(wait_idle(float(a.get("timeout") or 900), a.get("target") or None))
+        out = jdump(wait_idle(float(a.get("timeout") or 0) or None, a.get("target") or None))
     elif cmd == "job-layout":
         lay = job_layout(a.get("task_gpu"), a.get("model"), a.get("mode"))
         if a.get("plain") and lay.get("ok"):
             dash = lambda v: "-" if v is None else str(v)  # noqa: E731
+            budget = swap_budget_s(find_model(lay["model"]) if lay.get("model") else None)
             print(lay["mode"], dash(lay["model"]), dash(lay["llm_gpu"]), dash(lay["task_gpu"]),
-                  lay["applied"])
+                  lay["applied"], budget, cache_dir(), get_cfg()["comfy_url"], dash(nvidia_smi_path()))
             return 0
         out = jdump(lay)
     elif cmd == "after-job":
-        out = jdump(after_job(a.get("prefer") or None, float(a.get("timeout") or 900)))
+        out = jdump(after_job(a.get("prefer") or None, float(a.get("timeout") or 0) or None))
     elif cmd == "start":
         out = jdump(autostart_primary())
     elif cmd == "stop":
@@ -2387,6 +2733,10 @@ def cli_sms(args) -> int:
                 logs: list[str] = []
                 res = (graceful_stop(lambda m: (logs.append(m), print(m, file=sys.stderr, flush=True)))
                        if a.get("graceful") else stop_server())
+                if res.get("ok"):  # a deliberate stop: the watcher must not "recover" it
+                    write_state({"state": "idle", "current": None, "spawned_at": None,
+                                 "last_stop": {"at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                               "graceful": bool(a.get("graceful"))}})
                 out = jdump({**res, **({"log": logs} if logs else {})})
     elif cmd == "cmd":
         entry = find_model(str(a.get("model") or ""))

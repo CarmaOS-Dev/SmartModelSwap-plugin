@@ -1,5 +1,5 @@
 name: smart-model-swap
-version: "0.5.0"
+version: "0.5.1"
 manifest_version: 2
 requires_hermes: ">=0.23.0"
 license: MIT
@@ -18,7 +18,6 @@ provides_hooks:
   - pre_llm_call
   - pre_tool_call
   - pre_transcription
-entry: __init__.py
 config_schema:
   primary_model:
     type: str
@@ -43,7 +42,7 @@ config_schema:
   isolate_scope:
     type: bool
     label: Isolate models from gateway restarts
-    description: Run the runner and the models in their own transient cgroup (systemd-run --user --scope) so restarting the gateway does not kill them. Not a service - start and stop never go through systemd.
+    description: Run the runner and the watcher as transient user services (systemd-run --user) and each model in its own transient scope, so neither a gateway restart nor a killed command that started a swap (a terminal timeout) takes them down. Models are still started and stopped by SMP itself, by signal. Off, or without a user systemd, they are double-forked into their own session (survives a killed command, not a gateway restart).
     default: true
   models_file:
     type: str
@@ -70,6 +69,11 @@ config_schema:
     label: Drain maximum (s)
     description: Hard cap on the drain even while a request keeps generating (a long reasoning reply), so a swap never waits forever.
     default: 600
+  drain_quiet_s:
+    type: int
+    label: Drain quiet window (s)
+    description: The engine must stay without requests for this many seconds in a row before the model is cut. A turn is a chain of requests with short gaps (tool calls), so one idle read does not mean it ended (0 = cut on the first idle read).
+    default: 8
   vram_settle_mib:
     type: int
     label: VRAM settle threshold (MiB)
@@ -88,8 +92,13 @@ config_schema:
   idle_restore_min:
     type: int
     label: Restore the primary after N idle minutes
-    description: After a swap to a smaller model, bring the primary back once the engine has been idle this long (no tokens processed, no gpu_job.sh running, no other GPU users) and its VRAM is free. 0 disables it.
+    description: After a swap to a smaller model, bring the primary back once the engine has been idle this long (no tokens processed, no gpu_job.sh running, no ComfyUI work queued or running) and the release gate passes. 0 disables it.
     default: 15
+  comfy_free_on_idle:
+    type: bool
+    label: Ask an idle ComfyUI to release its VRAM
+    description: When the idle restore is due but the primary does not fit because an idle ComfyUI (empty queue) still caches models in VRAM, ask it to unload them (POST /free) and try again. ComfyUI keeps running; nothing is killed.
+    default: true
   gpu_job_mode:
     type: str
     label: What to do with the LLM during a GPU job
@@ -108,12 +117,12 @@ config_schema:
   block_when_unloaded:
     type: bool
     label: Answer at once while the LLM is unloaded on purpose
-    description: When a message arrives while a gpu_job.sh holds the GPU or a swap/load is in flight, end the turn immediately with an explanation (the user is asked to resend) instead of letting Hermes retry for minutes and fail with "HTTP 503 Loading model".
+    description: When a message arrives while a gpu_job.sh holds the GPU, a swap/load is in flight, or an interrupted swap is being resumed, end the turn immediately with an explanation (the user is asked to resend) instead of letting Hermes retry for minutes and fail with "HTTP 503 Loading model".
     default: true
   guard_tools:
     type: bool
     label: Block manual LLM management by the agent
-    description: Vetoes terminal/execute_code commands that stop, kill or launch llama-server behind SmartModelProvider (systemctl llama-server, pkill, ~/llama-server.sh), and ComfyUI launches while the primary model holds the GPU unless they go through gpu_job.sh or carry SMS_ALLOW_GPU=1. Blocks are logged in cache/smart-model-swap/guard.log.
+    description: Vetoes terminal/execute_code commands that stop, kill or launch llama-server behind SmartModelProvider (systemctl llama-server, pkill, ~/llama-server.sh); ComfyUI launches while any model is loaded or a swap runs, unless they go through gpu_job.sh or carry SMS_ALLOW_GPU=1; blocking `hermes sms` commands (swap/restore --wait, wait, after-job, stop --graceful) in the foreground; and gpu_job.sh in the foreground or without notify=true. Blocks are logged in cache/smart-model-swap/guard.log.
     default: true
   inject_status:
     type: bool

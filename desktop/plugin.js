@@ -210,6 +210,12 @@ const I18N = {
     setRecoverHint: 'Si un modelo falla al cargar o se cae, se carga otro que quepa.',
     setAutostart: 'Cargar el primario al iniciar',
     setAutostartHint: 'Al arrancar el gateway siempre se carga el primario, aunque haya quedado otro sirviendo.',
+    setComfyFree: 'Liberar ComfyUI ocioso',
+    setComfyFreeHint: 'Si toca volver al primario y no cabe porque un ComfyUI sin trabajo guarda modelos en VRAM, se le pide que los descargue (no se cierra).',
+    watcherOn: (target, min) => "Vigilante activo sobre '" + target + "'" + (min > 0 ? '; el primario vuelve tras ' + min + ' min sin actividad.' : '.'),
+    watcherOff: 'Sin vigilante: no hay vuelta automática al primario ni auto-recuperación ahora mismo.',
+    holderNote: txt => 'Otro uso de la GPU: ' + txt,
+    failureNote: (m, why, at) => "Fallo reciente de '" + m + "' (" + why + ', ' + at + '): no se reintenta solo durante 30 min.',
     setSaved: 'Ajuste guardado.',
     on: 'activado',
     off: 'desactivado',
@@ -396,6 +402,12 @@ const I18N = {
     setRecoverHint: 'If a model fails to load or dies, another one that fits is loaded.',
     setAutostart: 'Load the primary at start-up',
     setAutostartHint: 'When the gateway starts the primary is always loaded, even if another model was left serving.',
+    setComfyFree: 'Free an idle ComfyUI',
+    setComfyFreeHint: 'When the primary is due back but does not fit because an idle ComfyUI keeps models in VRAM, it is asked to unload them (it keeps running).',
+    watcherOn: (target, min) => "Watcher active on '" + target + "'" + (min > 0 ? '; the primary returns after ' + min + ' idle min.' : '.'),
+    watcherOff: 'No watcher: no automatic return to the primary and no auto-recover right now.',
+    holderNote: txt => 'Other GPU user: ' + txt,
+    failureNote: (m, why, at) => "Recent failure of '" + m + "' (" + why + ', ' + at + '): not retried automatically for 30 min.',
     setSaved: 'Setting saved.',
     on: 'on',
     off: 'off',
@@ -1479,6 +1491,17 @@ function GpuModePicker({ gpuModes, disabled, onPick }) {
   )
 }
 
+// Watcher, other GPU users and recent failures, one muted line each.
+function sysNotes(status, settings) {
+  const out = []
+  const w = status.watcher
+  if (w && (w.target || w.pid)) out.push(t('watcherOn', w.target || '?', w.minutes ?? (settings || {}).idle_restore_min))
+  else if (status.llm && status.llm.up) out.push(t('watcherOff'))
+  for (const x of status.gpu_holders || []) out.push(t('holderNote', x))
+  for (const f of status.failures || []) out.push(t('failureNote', f.model, f.why, String(f.at || '').slice(11, 16)))
+  return out
+}
+
 // The same behaviour settings the dashboard shows; each one saves on change.
 function SettingsSection({ settings, gpuModes, disabled, onSave, onPickMode }) {
   const s = settings || {}
@@ -1540,6 +1563,11 @@ function SettingsSection({ settings, gpuModes, disabled, onSave, onPickMode }) {
             SettingRow,
             { id: 'sms-set-autostart', label: t('setAutostart'), hint: t('setAutostartHint') },
             h(Toggle, { labelId: 'sms-set-autostart', value: !!s.autostart_primary, disabled, onChange: v => onSave('autostart_primary', v) })
+          ),
+          h(
+            SettingRow,
+            { id: 'sms-set-comfyfree', label: t('setComfyFree'), hint: t('setComfyFreeHint') },
+            h(Toggle, { labelId: 'sms-set-comfyfree', value: s.comfy_free_on_idle !== false, disabled, onChange: v => onSave('comfy_free_on_idle', v) })
           )
         )
       : undefined
@@ -1883,6 +1911,9 @@ function SwapPane({ rest }) {
                     )
                   })
                 : null,
+              ...sysNotes(status, data && data.settings).map((n, i) =>
+                jsx('div', { key: 'sys' + i, className: 'mt-0.5 text-[10px] text-(--ui-text-tertiary)', children: n })
+              ),
               jsxs('div', {
                 className: 'mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-(--ui-text-tertiary)',
                 children: [

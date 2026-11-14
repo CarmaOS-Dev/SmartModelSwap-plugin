@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.5.1
+
+**Incident of 2026-11-13: the primary did not come back**
+- **Fix: a killed command took the model load with it.** `hermes sms restore --wait` run in a foreground terminal hit the tool's 180 s timeout, and Hermes killed its whole process tree. That tree included the runner and the `llama-server` it was loading: `systemd-run --scope` keeps the process a child of whoever spawned it.
+  - The runner and the watcher are now transient user **services** (`sms-runner-*.service`, parent: systemd), or double-forked without a user systemd. They are never descendants of the gateway, the CLI or `gpu_job.sh`.
+  - Models keep their own `sms-llm-*` scope.
+  - The runner registers its own PID and process start time.
+  - A freshly spawned runner counts as busy for 30 s until it does.
+- **Interrupted swaps resume.** A swap/restore/start whose runner died mid-flight is relaunched once by the watcher, without counting it as a model failure.
+  - Before, a SIGKILLed load was logged as "died on its own", the primary was excluded for 30 min, and the small model was loaded instead.
+  - A watcher that finds a failed swap with nothing serving loads a model again instead of exiting with "stopped on purpose".
+- **Fix: an idle ComfyUI blocked the idle restore forever.** Only work in ComfyUI's queue (`/queue`) now pauses the idle clock.
+  - When the primary does not fit because an idle ComfyUI caches models, ComfyUI is asked to unload them (`POST /free`; new setting `comfy_free_on_idle`, default on, in both UIs). It is never killed.
+  - Start-up uses the same rule.
+  - The watcher logs when ComfyUI pauses it; before, it did so silently.
+
+**Guard**
+- **Blocks blocking `hermes sms` commands in the foreground:** `swap|restore --wait`, `wait`, `after-job`, `stop --graceful`. They are allowed with `background=true` and `notify=true`. The message points to `sms_restore` as the last tool.
+- **No more blanket exemptions.** Mentioning `hermes sms` or `gpu_job.sh` used to exempt a whole command: `echo hermes sms; pkill llama-server` passed. Every segment is checked now, and only an executed `gpu_job.sh` lets ComfyUI through.
+- **ComfyUI launched by hand is blocked while any model is loaded** or a swap runs, not only the primary.
+- `guard_tools`, `block_when_unloaded` and `comfy_free_on_idle` are parsed as booleans (`"false"` was truthy).
+
+**Waits and GPU jobs**
+- **Swap budget.** Every `--wait`/`--timeout` defaults to the worst case of that swap, computed from the settings (`sms_status` → `swap_budget_s`; ≈ 22 min for a 420 s load). Before, the fixed 900 s could give up on a swap that was still draining a long reply.
+- **`--wait` waits for a running swap** and asks again, instead of failing at once. `wait` ignores a result older than its launch, so a killed runner is no longer reported with the previous swap's outcome.
+- **`after-job` no longer measures VRAM mid-swap.** It waits for a running swap first, and treats "another swap holds the lock" as wait-and-retry; `hermes sms check` does the same. This fixes a job whose FREE step timed out, then failed to bring any model back while the swap finished behind it.
+- **`gpu_job.sh`:**
+  - one job at a time (`flock`; a second one exits 3);
+  - ComfyUI URL and `nvidia-smi` come from the settings (`job-layout --plain` gained fields);
+  - optional `JOB_TIMEOUT`;
+  - the marker records the applied mode (correct veto message);
+  - job logs are kept for 14 days.
+
+**State, agent guidance, cleanup**
+- **`state.json` and `vram_profile.json` are updated under a file lock.** Concurrent writers (gateway, CLI, runner, watcher) used to drop each other's fields. A state file that does not parse is kept as `state.json.corrupt`.
+- **One watcher at a time,** enforced by a lock held for its whole life instead of a PID file.
+- **Agent guidance:**
+  - the skill (1.1.0), the deep-work hint and the tool schemas no longer recommend a foreground `restore --wait`; `sms_restore` as the last tool is the way;
+  - "never start ComfyUI outside `gpu_job.sh`";
+  - what to do after a timeout or `free=FAILED`;
+  - `force` added to `sms_swap`/`sms_restore`;
+  - the long small-model hint is shown once per cooldown;
+  - the unloaded veto also covers an interrupted swap and no longer depends on `inject_status`.
+- **Runner and watcher environment.** They get an allow-listed environment, without provider API keys.
+- **UIs.** Both show the watcher, other GPU users and recent failures. `sms_status` returns `watcher`, `failures` and `swap_budget_s`.
+- **Removed:** a duplicate `_pid_alive` (the one in use treated an unreadable process as alive), `stop_llm`, `vram_available_for_swap`. The `/proc` scan for the engine reads `models.json` once instead of once per process. `/swap` usage messages are localized.
+- **Docs:** README sections Timeouts, Troubleshooting and Development; INSTALL uninstall order; dashboard manifest version.
+
+**Earlier unreleased changes, shipped in 0.5.1**
+
+- **Fix: a GPU job result that was never delivered.** The guard now also refuses `gpu_job.sh` in the background without `notify=true`. With a list of patterns (`notify=["^SAVED="]`) Hermes sends no notification when the job ends, so the agent stayed silent until asked. The guard message, the skill and the template name the real parameter (`notify=true`, not `notify_on_complete`), and the hint for the small model says to send the file of the `SAVED=` line.
+- **Fix: the guard blocked commands that only read `gpu_job.sh`** (`head`, `cat`). It now acts when the script is executed.
+- **Fix: a swap cut a request that had just started.** The drain waits until the engine has been idle for `drain_quiet_s` (new setting, default 8 s) instead of trusting one idle read, and looks once more right before the stop.
+- **Fix: the watcher quit when the engine was slow to answer.** A server whose process is alive but does not answer `/health` (a host under memory pressure) is still watched; before, the watcher logged "stopped on purpose" and exited.
+- **Auto-recover reloads a model that was stopped from outside.** A model whose log ends with a clean shutdown (a signal that did not come from SmartModelProvider) is loaded again once, instead of being replaced by a smaller one for 30 minutes.
+- A value-less switch repeated in the engine's `common_args` and in the model's args (`--metrics`) is passed once.
+- `runner.log` and the engine logs keep one previous generation after 5 MB; expired failure records are dropped.
+- Manifest: removed the `entry` field, which Hermes does not know and reported on every plugin load.
+- Tests (`tests/`, standard library `unittest`).
+
 ## 0.5.0
 
 **Catalog review**

@@ -12,9 +12,10 @@ itself (except the idle watcher, which lives in the runner).
                the primary is loaded, or like deep work while a small model is
                loaded.
 
-Voice and keyword hints are throttled per session (one per kind every
-HINT_COOLDOWN_S) and respect the swap hysteresis (no hint within
-HYSTERESIS_S of the last swap/restore).
+Hints are throttled per (session, kind): one every HINT_COOLDOWN_S. The voice
+hint also respects the swap hysteresis (none within HYSTERESIS_S of the last
+swap/restore). The one-line "small model active" status is shown every turn;
+its longer guidance only once per cooldown.
 """
 from __future__ import annotations
 
@@ -86,11 +87,12 @@ def _smallest(tools) -> str | None:
     return min(models, key=lambda m: float(m.get("min_free_vram_gb") or 0)).get("name")
 
 
-def unloaded_veto(tools, busy_state: dict | None) -> dict | None:
-    """The LLM is not serving ON PURPOSE (a gpu_job.sh holds the GPU, or a swap /
-    load is in flight): end the turn at once with an explanation instead of
-    letting Hermes retry for minutes and fail. Hermes drops the vetoed message,
-    so the user is asked to send it again."""
+def unloaded_veto(tools, busy_state: dict | None, interrupted: dict | None = None) -> dict | None:
+    """The LLM is not serving ON PURPOSE (a gpu_job.sh holds the GPU, a swap /
+    load is in flight, or one was interrupted and the watcher is resuming it):
+    end the turn at once with an explanation instead of letting Hermes retry
+    for minutes and fail. Hermes drops the vetoed message, so the user is asked
+    to send it again."""
     t = tools.smp_i18n.t
     job = tools.gpu_job_info()
     if job:
@@ -116,24 +118,37 @@ def unloaded_veto(tools, busy_state: dict | None) -> dict | None:
             "unos minutos). Vuelve a enviar tu mensaje en un momento.",
             f"⏳ I can't answer right now: the model '{target}' is loading ({action}, a few "
             "minutes). Please send your message again shortly.")}
+    if interrupted:
+        target = interrupted.get("target") or "?"
+        return {"action": "block", "message": t(
+            f"⏳ Ahora mismo no puedo responder: el cambio al modelo '{target}' se interrumpió y se "
+            "está retomando solo (unos minutos). Vuelve a enviar tu mensaje en un momento.",
+            f"⏳ I can't answer right now: the switch to the model '{target}' was interrupted and is "
+            "being resumed automatically (a few minutes). Please send your message again shortly.")}
     return None
 
 
 def build_context(tools, **kwargs) -> dict | None:
     cfg = tools.get_cfg()
-    if not cfg.get("inject_status", True):
-        return None
     st = tools.read_state()
     busy = st.get("state") in tools.BUSY_STATES and tools.runner_alive(st)
-    health = tools.llm_health(timeout=1.0)
+    if cfg.get("block_when_unloaded", True) or cfg.get("inject_status", True):
+        health = tools.llm_health(timeout=1.0)
+    else:
+        return None
     if not health.get("up") and cfg.get("block_when_unloaded", True):
-        veto = unloaded_veto(tools, st if busy else None)
+        lost = None if busy else tools.runner_died_midflight(st)
+        if lost and not cfg.get("auto_recover", True):
+            lost = None  # nobody resumes it: let Hermes report the outage
+        veto = unloaded_veto(tools, st if busy else None, lost)
         if veto:
             return veto
+    if not cfg.get("inject_status", True):
+        return None
     if busy:
         return {"context": f"[smart-model-swap] A model {st.get('action')} to '{st.get('target')}' "
                            "is in progress; the local LLM will be unavailable for a moment. "
-                           "Keep this reply short."}
+                           "Reply in one short sentence and make no tool calls this turn."}
     now = time.time()
     current = tools.match_model(health)
     primary = cfg.get("primary_model")
@@ -148,17 +163,21 @@ def build_context(tools, **kwargs) -> dict | None:
         entry = tools.find_model(current) or {}
         ctx_n = tools.model_ctx(entry)
         idle = float(cfg.get("idle_restore_min") or 0)
-        lines.append(
-            f"[smart-model-swap] Active local model: '{current}'"
-            + (f" (context {ctx_n} tokens)" if ctx_n else "")
-            + f". The primary '{primary}' is unloaded to free VRAM"
-            + (f"; it comes back by itself after {idle:g} idle minutes" if idle > 0 else "")
-            + ". Answer simple requests (delivering a finished GPU job, chat, quick facts) on this "
-              f"model; call sms_restore only when deep work is asked for ({tools.SKILL_REF}).")
+        line = (f"[smart-model-swap] Active local model: '{current}'"
+                + (f" (context {ctx_n} tokens)" if ctx_n else "")
+                + f". The primary '{primary}' is unloaded to free VRAM"
+                + (f"; it comes back by itself after {idle:g} idle minutes" if idle > 0 else "") + ".")
+        if _cooldown_ok(session, "small", now):
+            line += (" Answer simple requests (delivering a finished GPU job, chat, quick facts) on this "
+                     f"model; call sms_restore only when deep work is asked for ({tools.SKILL_REF}). "
+                     "When a background job has finished, deliver its result now: send the user the file "
+                     "named in its `SAVED=` line (the file itself, not only a description).")
+        lines.append(line)
         if msg and DEEP_RX.search(msg) and _cooldown_ok(session, "deep", now):
             lines.append("[smart-model-swap] This looks like deep work and you are on the small model: "
-                         "run `hermes sms check`, then `hermes sms restore --wait` (procedure B) "
-                         "unless a GPU job still holds the VRAM.")
+                         "unless a GPU job still holds the VRAM, tell the user you are switching to the "
+                         f"primary '{primary}' and call sms_restore as the LAST tool call of this turn "
+                         "(procedure B). Never `hermes sms restore --wait` in a foreground terminal.")
     elif on_primary:
         if msg and GPU_RX.search(msg) and _cooldown_ok(session, "gpu", now):
             lines.append("[smart-model-swap] If this needs ComfyUI/GPU work: the primary model holds "

@@ -5,8 +5,11 @@ used to stop the brain with `systemctl --user stop llama-server` / `pkill`
 and bring it back with the old unit — which leaves SMP with an "external"
 server, races the runner and, on failure, no brain at all. This hook vetoes
 those commands (the veto message becomes the tool result, so the agent learns
-the right path) and launches of ComfyUI while the primary model holds the
-GPU, unless they go through gpu_job.sh or carry SMS_ALLOW_GPU=1.
+the right path), launches of ComfyUI while a model holds the GPU (unless they
+go through gpu_job.sh or carry SMS_ALLOW_GPU=1), and blocking `hermes sms`
+commands run in the foreground: a terminal timeout kills the command, and
+they can outlive any foreground timeout (swap --wait, restore --wait, wait,
+after-job, stop --graceful).
 
 Read-only commands (status, journalctl, grep, ps, cat …) are never blocked.
 Shell scripts run by the command are scanned too (comment lines ignored).
@@ -20,9 +23,14 @@ import time
 from pathlib import Path
 
 def skill_hint(tools) -> str:
-    return ("Use sms_swap / sms_restore, `hermes sms stop|start`, or for GPU work "
-            f"`bash {tools.gpu_job_script()} <small-model|none> -- <job>` "
-            f"(frees VRAM through SMP and always restores). Rules: {tools.SKILL_REF}.")
+    return ("Use sms_swap / sms_restore (as the LAST tool call of the turn), or for GPU work "
+            f"`bash {tools.gpu_job_script()} auto -- <job>` in the background with notify=true "
+            f"(frees VRAM through SMP and always leaves a model serving). Rules: {tools.SKILL_REF}.")
+
+
+# `hermes sms` subcommands that block until a swap ends (minutes, up to the
+# swap budget): never in a foreground terminal.
+_SMS_BLOCKING = "hermes sms swap/restore --wait, wait, after-job, stop --graceful"
 
 _SEG_SPLIT = re.compile(r"\|\||&&|[;|&\n]")
 _WRAPPERS = {"sudo", "nohup", "exec", "setsid", "env", "time", "command", "stdbuf", "nice", "ionice",
@@ -38,6 +46,8 @@ _RX_PKILL = re.compile(r"\b(?:pkill|killall)\b[^\n]*llama")
 _RX_KILL_PGREP = re.compile(r"(?:\bkill\b[^\n]*(?:\$\(|`)\s*pgrep[^\n]*llama)|(?:pgrep[^\n|]*llama[^\n]*\|\s*xargs\b[^\n]*\bkill\b)")
 _RX_LAUNCH = re.compile(r"llama-server['\"]?\s*(?:,\s*['\"])?\s*(?:-m|--model|-hf|--hf-repo)\b")
 _RX_COMFY = re.compile(r"main\.py\b[^\n]*(?:--port\s*['\"]?8188|--listen)|ComfyUI[^\n]*main\.py")
+_RX_SMS_BLOCKING = re.compile(r"hermes\s+sms\s+(?:(?:swap|restore)\b[^\n]*--wait\b|wait\b|after-job\b"
+                              r"|stop\b[^\n]*--graceful\b)")
 
 
 def _words(segment: str) -> list[str]:
@@ -68,12 +78,28 @@ def _program(words: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
-def _shell_findings(text: str, cwd: str | None = None) -> tuple[list[str], list[str], bool]:
-    """(llm_violations, scripts_to_scan, launches_comfy) for one shell command text.
-    Follows `cd` so relative script paths resolve (scripts come back absolute when possible)."""
+def _sms_blocking(prog: str, args: list[str]) -> str | None:
+    """`hermes sms <sub>` that blocks until a swap ends, else None."""
+    if prog != "hermes" or len(args) < 2 or args[0] != "sms":
+        return None
+    sub, rest = args[1], args[2:]
+    if sub in ("swap", "restore") and "--wait" in rest and "--dry-run" not in rest:
+        return f"hermes sms {sub} --wait"
+    if sub in ("wait", "after-job"):
+        return f"hermes sms {sub}"
+    if sub == "stop" and "--graceful" in rest:
+        return "hermes sms stop --graceful"
+    return None
+
+
+def _shell_findings(text: str, cwd: str | None = None) -> tuple[list[str], list[str], bool, list[str]]:
+    """(llm_violations, scripts_to_scan, launches_comfy, blocking_sms) for one
+    shell command text. Follows `cd` so relative script paths resolve (scripts
+    come back absolute when possible)."""
     bad: list[str] = []
     scripts: list[str] = []
     comfy = False
+    blocking: list[str] = []
 
     def resolve(path: str) -> str:
         path = os.path.expanduser(path)
@@ -89,6 +115,9 @@ def _shell_findings(text: str, cwd: str | None = None) -> tuple[list[str], list[
             if not prog:
                 continue
             joined = " ".join(args)
+            blk = _sms_blocking(prog, args)
+            if blk:
+                blocking.append(blk)
             if prog == "cd":
                 cwd = resolve(args[0]) if args else os.path.expanduser("~")
                 continue
@@ -104,10 +133,11 @@ def _shell_findings(text: str, cwd: str | None = None) -> tuple[list[str], list[
             elif prog == "llama-server.sh" or (prog in _SHELLS and args and os.path.basename(args[0]) == "llama-server.sh"):
                 bad.append("running ~/llama-server.sh: the old launcher is retired")
             if prog in _SHELLS and len(args) >= 2 and args[0] in ("-c", "-lc", "-lic", "-ic"):
-                b2, s2, c2 = _shell_findings(args[1], cwd)
+                b2, s2, c2, k2 = _shell_findings(args[1], cwd)
                 bad += b2
                 scripts += s2
                 comfy |= c2
+                blocking += k2
             elif prog in _SHELLS and args and not args[0].startswith("-"):
                 scripts.append(resolve(args[0]))
             elif prog.endswith(".sh"):
@@ -119,7 +149,7 @@ def _shell_findings(text: str, cwd: str | None = None) -> tuple[list[str], list[
             bad.append("`kill` on pgrep'd llama-server PIDs: killing the engine behind SMP")
         if _RX_COMFY.search(line):
             comfy = True
-    return bad, scripts, comfy
+    return bad, scripts, comfy, blocking
 
 
 def _scan_script(path: str, cwd: str | None) -> str | None:
@@ -137,18 +167,23 @@ def _scan_script(path: str, cwd: str | None) -> str | None:
 
 
 def inspect(tool_name: str, args: dict) -> dict:
-    """{'violations': [...], 'comfy': bool, 'gpu_job': bool, 'allow_gpu': bool}"""
-    out = {"violations": [], "comfy": False, "gpu_job": False, "allow_gpu": False}
+    """{'violations': [...], 'comfy': bool, 'gpu_job': bool, 'runs_gpu_job': bool,
+    'allow_gpu': bool, 'sms_blocking': [...]}
+
+    gpu_job / runs_gpu_job: the command EXECUTES gpu_job.sh (reading it with
+    cat/head, or naming it in an echo, does not count).
+    sms_blocking: `hermes sms` commands that block until a swap ends."""
+    out = {"violations": [], "comfy": False, "gpu_job": False, "runs_gpu_job": False,
+           "allow_gpu": False, "sms_blocking": []}
     if tool_name == "terminal":
         text = str(args.get("command") or "")
         cwd = args.get("workdir") or args.get("cwd")
-        out["gpu_job"] = "gpu_job.sh" in text
-        out["allow_gpu"] = "SMS_ALLOW_GPU=1" in text
-        if "hermes sms" in text and not re.search(r"systemctl|pkill|killall|llama-server\.sh", text):
-            return out
-        bad, scripts, comfy = _shell_findings(text, cwd)
+        out["allow_gpu"] = bool(re.search(r"(^|[\s;&|(])SMS_ALLOW_GPU=1\b", text))
+        bad, scripts, comfy, blocking = _shell_findings(text, cwd)
+        out["runs_gpu_job"] = out["gpu_job"] = any(os.path.basename(s) == "gpu_job.sh" for s in scripts)
         out["violations"] += bad
         out["comfy"] |= comfy
+        out["sms_blocking"] += blocking
         seen = set()
         for sc in scripts[:6]:
             if sc in seen or os.path.basename(sc) == "gpu_job.sh":
@@ -157,9 +192,10 @@ def inspect(tool_name: str, args: dict) -> dict:
             body = _scan_script(sc, cwd)
             if body is None:
                 continue
-            b2, _s2, c2 = _shell_findings(body)
+            b2, _s2, c2, k2 = _shell_findings(body)
             out["violations"] += [f"{v} (in {sc})" for v in b2]
             out["comfy"] |= c2
+            out["sms_blocking"] += [f"{k} (in {sc})" for k in k2]
             out["allow_gpu"] |= "SMS_ALLOW_GPU=1" in body
     elif tool_name == "execute_code":
         code = str(args.get("code") or "")
@@ -172,7 +208,28 @@ def inspect(tool_name: str, args: dict) -> dict:
         out["comfy"] = bool(_RX_COMFY.search(code))
         out["gpu_job"] = "gpu_job.sh" in code
         out["allow_gpu"] = "SMS_ALLOW_GPU=1" in code
+        m = _RX_SMS_BLOCKING.search(code)
+        if m:
+            out["sms_blocking"].append(m.group(0).strip()[:60])
     return out
+
+
+def _truthy(v) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return v is True or (isinstance(v, (int, float)) and not isinstance(v, bool) and v != 0)
+
+
+def notifies(args: dict) -> bool:
+    """Will Hermes tell the agent when this background terminal command ends?
+    `notify=true` (or the older `notify_on_complete=true`) and `heartbeat=N` do.
+    `notify=[patterns]` does not: it only fires on matching output lines."""
+    if _truthy(args.get("notify")) or _truthy(args.get("notify_on_complete")):
+        return True
+    try:
+        return int(args.get("heartbeat") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _audit(cache_dir: Path, msg: str) -> None:
@@ -192,15 +249,38 @@ def make_hook(tools):
             if not tools.get_cfg().get("guard_tools", True):
                 return None
             found = inspect(tool_name, args or {})
-            if (tool_name == "terminal" and found["gpu_job"] and not (args or {}).get("background")
-                    and not found["violations"]):
-                _audit(tools.cache_dir(), "BLOCK terminal: gpu_job.sh in the foreground")
+            if tool_name == "terminal" and found["runs_gpu_job"] and not found["violations"]:
+                how = ("Launch it with the terminal tool, background=true and notify=true (exactly "
+                       "`true`, not a list of patterns: only `true` sends the notification when the job "
+                       "ends), and nothing appended after the job command.")
+                after = ("After launching it reply in one short sentence and END your turn: make no "
+                         "further tool or model calls until the completion notification arrives, then "
+                         "deliver the result (attach the file of the `SAVED=` line).")
+                if not _truthy((args or {}).get("background")):
+                    _audit(tools.cache_dir(), "BLOCK terminal: gpu_job.sh in the foreground")
+                    return {"action": "block", "message":
+                            "[smart-model-swap guard] Blocked: gpu_job.sh must run in the BACKGROUND. "
+                            "It unloads or swaps the model that runs this conversation. "
+                            f"{how} {after}"}
+                if not notifies(args or {}):
+                    _audit(tools.cache_dir(), "BLOCK terminal: gpu_job.sh without a completion notification")
+                    return {"action": "block", "message":
+                            "[smart-model-swap guard] Blocked: this would run gpu_job.sh without a "
+                            "completion notification, so the result would never be delivered to the user. "
+                            f"{how} {after}"}
+            blocking = list(dict.fromkeys(found["sms_blocking"]))
+            if blocking and not found["violations"] and not (
+                    tool_name == "terminal" and _truthy((args or {}).get("background")) and notifies(args or {})):
+                _audit(tools.cache_dir(), f"BLOCK {tool_name}: blocking `{'; '.join(blocking)}` in the foreground")
                 return {"action": "block", "message":
-                        "[smart-model-swap guard] Blocked: gpu_job.sh must run in the BACKGROUND "
-                        "(terminal background=true, notify_on_complete=true). It unloads or swaps the "
-                        "model that runs this conversation, so after launching it reply in one short "
-                        "sentence and END your turn: make no further tool or model calls until the "
-                        "completion notification arrives (the primary model is back by then)."}
+                        f"[smart-model-swap guard] Blocked: `{'; '.join(blocking)}` waits until a model swap "
+                        f"ends, which can take up to ~{tools.swap_budget_s() // 60} min. A foreground command "
+                        "is killed by the tool timeout, and that kill used to take the model load with it. "
+                        "Instead: call sms_restore / sms_swap as the LAST tool call of the turn and tell the "
+                        "user the model is switching (the next turn runs on it); or run "
+                        "`hermes sms restore` (no --wait) and then `hermes sms wait` with background=true and "
+                        "notify=true. After a timeout never re-run the swap: `hermes sms status` shows it is "
+                        f"still going. ({_SMS_BLOCKING} are the blocking forms.)"}
             if found["violations"]:
                 why = "; ".join(dict.fromkeys(found["violations"]))
                 _audit(tools.cache_dir(), f"BLOCK {tool_name}: {why}")
@@ -209,16 +289,18 @@ def make_hook(tools):
                         f"SmartModelProvider; stopping/starting it by hand breaks swaps and can leave "
                         f"the agent without a model. {skill_hint(tools)}"}
             if found["comfy"] and not (found["gpu_job"] or found["allow_gpu"]):
-                primary = tools.get_cfg().get("primary_model")
+                busy = tools.busy_state()
                 current = tools.match_model(tools.llm_health(timeout=1.5))
-                if current and tools.same_name(current, primary):
-                    _audit(tools.cache_dir(), f"BLOCK {tool_name}: ComfyUI launch while '{current}' is loaded")
+                if current or busy:
+                    what = f"a model swap is in flight ({busy})" if busy else f"'{current}' holds the GPU"
+                    _audit(tools.cache_dir(), f"BLOCK {tool_name}: ComfyUI launch while {what}")
                     return {"action": "block", "message":
-                            f"[smart-model-swap guard] Blocked: launching ComfyUI while the primary model "
-                            f"'{current}' holds the GPU. Run the job through gpu_job.sh (frees VRAM via SMP "
-                            f"and restores the primary afterwards). If `sms_plan` (single_gpu=true) says the "
-                            f"task already fits, re-run the same command prefixed with SMS_ALLOW_GPU=1. "
-                            f"{skill_hint(tools)}"}
+                            f"[smart-model-swap guard] Blocked: launching ComfyUI by hand while {what}. "
+                            f"Run the job through gpu_job.sh: it moves the LLM out of the way through SMP, "
+                            f"runs the job and leaves a model serving afterwards (a ComfyUI left open by "
+                            f"hand also keeps the primary from coming back). If `sms_plan` "
+                            f"(single_gpu=true) says the task already fits, re-run the same command "
+                            f"prefixed with SMS_ALLOW_GPU=1. {skill_hint(tools)}"}
             return None
         except Exception:  # noqa: BLE001 - a guard must never break a tool call
             return None

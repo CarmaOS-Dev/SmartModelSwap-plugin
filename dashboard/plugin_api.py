@@ -30,7 +30,7 @@ Endpoints
   POST   /provider/install   install SmartModelProvider's model-provider half - user request only
   POST   /provider/remove    remove it again
   POST   /gpu_job/mode       GPU job mode: what `gpu_job.sh auto` does with the LLM (auto/none/nano/multi/keep)
-  POST   /settings           one behaviour setting: gpu_job_mode, after_gpu_job, idle_restore_min, auto_recover, autostart_primary
+  POST   /settings           one behaviour setting: gpu_job_mode, after_gpu_job, idle_restore_min, auto_recover, autostart_primary, comfy_free_on_idle
   POST   /swap               hot-swap to a model (default: secondary slot)
   POST   /restore            restore the primary model
   GET    /health             re-probe every engine endpoint now (bypasses the cache)
@@ -74,7 +74,7 @@ t = i18n.t
 
 
 async def _request_lang(lang: Optional[str] = None) -> None:
-    """Both UIs send ?lang=<host locale>; messages follow it (default: Spanish).
+    """Both UIs send ?lang=<host locale>; messages follow it (default: English, or Hermes' display.language).
     Async so the ContextVar is set in the request task and copied into the
     threadpool that runs the sync endpoints."""
     i18n.set_lang(lang)
@@ -557,6 +557,7 @@ _UI_SETTINGS = {
     "idle_restore_min": ("int", (0, 720)),
     "auto_recover": ("bool", None),
     "autostart_primary": ("bool", None),
+    "comfy_free_on_idle": ("bool", None),
 }
 
 
@@ -567,6 +568,7 @@ def _settings_view(cfg: dict) -> dict:
         "idle_restore_min": int(float(cfg.get("idle_restore_min") or 0)),
         "auto_recover": bool(cfg.get("auto_recover", True)),
         "autostart_primary": bool(cfg.get("autostart_primary", True)),
+        "comfy_free_on_idle": bool(cfg.get("comfy_free_on_idle", True)),
     }
 
 

@@ -69,8 +69,9 @@ SWAP_SCHEMA = {
         "dry_run=true to validate without touching anything. The model answering this "
         "conversation is replaced: call this as the LAST tool of the turn, then give a "
         "short final reply. The next turn runs on the new model (check sms_status). "
-        "Every swap leaves ALL sessions without an LLM for 2-4 min: never swap for a "
-        "single message. Rules and the blocking CLI (`hermes sms swap X --wait`): "
+        "Every swap leaves ALL sessions without an LLM for a few minutes (longer if a reply "
+        "is still being generated): never swap for a single message. Never wait for it with "
+        "`hermes sms swap X --wait` in a foreground terminal (a timeout kills it). Rules: "
         "skill_view(\"smart-model-swap:smart-model-routing\"). Never start/stop llama-server by hand or via systemctl. "
         "After a swap to a smaller model, the primary is restored automatically once the "
         "engine has been idle for a while (setting idle_restore_min)."
@@ -91,6 +92,11 @@ SWAP_SCHEMA = {
                 "description": "Validate files, VRAM fit and runner liveness without starting anything. Default false.",
                 "default": False,
             },
+            "force": {
+                "type": "boolean",
+                "description": "Reload the model even if it is already serving (e.g. after editing its launch flags). Default false.",
+                "default": False,
+            },
         },
         "required": ["model"],
         "additionalProperties": False,
@@ -100,14 +106,15 @@ SWAP_SCHEMA = {
 RESTORE_SCHEMA = {
     "name": "sms_restore",
     "description": (
-        "Restore the primary model (the big agent brain) after a swap. Call it once "
-        "the GPU-heavy task that needed the VRAM has finished, or when the user asks "
-        "for analysis, coding or other work the small model handles poorly. "
+        "Restore the primary model (the big agent brain). Call it when the user asks for "
+        "analysis, coding or other deep work the small model handles poorly, or asks for "
+        "the primary. The end of a GPU job alone is NOT a reason: the small model delivers "
+        "the result and the primary comes back by itself once the engine is idle. "
         "Refused (without cutting the current model) while other heavy GPU processes "
-        "such as ComfyUI still hold the VRAM the primary needs: check first with "
-        "`hermes sms check` and close finished GPU jobs. "
-        "Backgrounded with the same grace countdown and request drain; call it as the "
-        "LAST tool of the turn. Use dry_run=true to validate first."
+        "such as a working ComfyUI still hold the VRAM the primary needs (`hermes sms check` "
+        "tells). Backgrounded with the same grace countdown and request drain: call it as the "
+        "LAST tool of the turn and tell the user the next turn runs on the primary. Never "
+        "`hermes sms restore --wait` in a foreground terminal. Use dry_run=true to validate first."
     ),
     "parameters": {
         "type": "object",
@@ -115,6 +122,11 @@ RESTORE_SCHEMA = {
             "dry_run": {
                 "type": "boolean",
                 "description": "Validate without starting anything. Default false.",
+                "default": False,
+            },
+            "force": {
+                "type": "boolean",
+                "description": "Reload the primary even if it is already serving. Default false.",
                 "default": False,
             },
         },

@@ -1,4 +1,4 @@
-# Smart-Model-Swap: installation guide (v0.5.0)
+# Smart-Model-Swap: installation guide (v0.5.1)
 
 ## Requirements
 - Hermes Agent **0.23.0** or newer.
@@ -49,6 +49,7 @@ On first load the plugin copies `models.example.json` to `models.json`. That fil
 | `auto_recover` | on | If a model fails to load or its server dies, load another one that fits. |
 | `gpu_job_mode` | `auto` | What `gpu_job.sh auto` does with the LLM during a GPU job (step 4). |
 | `after_gpu_job` | `small` | Which model answers when a GPU job ends: `small`, or `primary` to reload the big one at once. |
+| `comfy_free_on_idle` | on | When the primary is due back but an idle ComfyUI keeps models in VRAM, ask it to unload them (`/free`). |
 
 **Coming from a `llama-server` systemd unit?** Disable it so it does not race SMP for the port at boot: `systemctl --user disable --now llama-server`. SMP never reads or starts it.
 
@@ -72,6 +73,8 @@ hermes sms swap <small-model> --wait
 hermes sms check         # may the primary load now? lists who holds the GPU
 hermes sms restore --wait
 ```
+
+These `--wait` forms are for **your** terminal. The agent never runs them in the foreground (the guard blocks it): it calls `sms_swap`/`sms_restore` as the last tool of its turn.
 
 Each load records the VRAM the model takes per GPU (`~/.hermes/cache/smart-model-swap/vram_profile.json`). `sms_plan` and the release gate use these numbers after the first load of each model.
 
@@ -97,7 +100,8 @@ Everything lives in `~/.hermes/cache/smart-model-swap/`:
 - `runner.log`: swaps, restores, start-up, idle watcher and auto-recover;
 - `llama-<model>.log`: engine output;
 - `gpu_job_<date>.log`: one per `gpu_job.sh` run; `gpu_job.active` marks a job in progress;
-- `state.json`: swap state machine; `idle_watch.json`: the running watcher;
+- `state.json` (+ `state.lock`): swap state machine; `idle_watch.json` (+ `idle_watch.lock`): the running watcher;
+- `gpu_job_*.log` (kept 14 days), `gpu_job.active`, `gpu_job.lock`: GPU jobs;
 - `vram_profile.json`: measured VRAM;
 - `guard.log`: blocked commands;
 - `ui.json`: UI slots.
@@ -107,19 +111,20 @@ With a non-default Hermes profile (`HERMES_HOME`), the folder is under that home
 ## Uninstall
 ```bash
 hermes sms stop
+hermes sms provider remove   # only if you installed the provider (before disabling: the CLI comes with the plugin)
 hermes plugins disable smart-model-swap
-hermes sms provider remove   # only if you installed the provider
 ```
 Then delete `~/.hermes/plugins/smart-model-swap` and, optionally, `~/.hermes/cache/smart-model-swap`.
 
 ## Troubleshooting
 | Symptom | What to check |
 |---|---|
-| `nvidia-smi: No such file` on WSL | Set the `nvidia_smi` setting to `/usr/lib/wsl/lib/nvidia-smi`, or put `nvidia-smi` on `PATH`. |
+| `nvidia-smi: No such file` | The default setting is the WSL path. On native Linux the plugin falls back to `nvidia-smi` on `PATH`; set `nvidia_smi` to its full path if it is elsewhere. |
 | Model never comes up | Read `runner.log` and `llama-<model>.log`. Run `hermes sms cmd <model>` to see the exact launch line. |
 | `RESOURCES NOT RELEASED` in `runner.log` | Another process holds the VRAM. `hermes sms check` lists who. |
 | The small model was loaded and the big one came back after a gateway restart | Expected: start-up always loads the primary. Turn `autostart_primary` off to keep whatever is serving. |
 | The gateway started but a smaller model is still serving | A GPU job or ComfyUI was running, or the primary did not fit: see `smart-model-swap autostart` in the gateway log and `runner.log`. `hermes sms check` lists who holds the VRAM; then `hermes sms restore`. |
 | A different model than the one requested is serving | Auto-recover replaced a model that failed. `hermes sms status` → `last_result` and `runner.log` (`auto-recover`) say why. |
-| `server.mode: external` in `sms_status` | Something started `llama-server` outside SMP. Stop it and run `hermes sms start`. |
+| `server.mode: external` in `sms_status` | Something started `llama-server` outside SMP. Stop it and run `hermes sms restore`. |
+| More symptoms (interrupted swaps, small model stuck, `free=FAILED`) | See **Troubleshooting** in the README. |
 | Slow loads on WSL2 | GGUFs on a Windows drive (`/mnt/<drive>`, 9p) read at ~150 MB/s. Copies on the Linux filesystem load about 10× faster. |

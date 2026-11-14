@@ -13,8 +13,10 @@
 #
 #   The job reads the GPU it must use from $SMS_TASK_GPU (ComfyUI --cuda-device).
 #   Force the job's GPU with TASK_GPU=<n> in the environment.
+#   JOB_TIMEOUT=<seconds|30m|2h> stops a job that hangs (timeout(1), TERM then KILL).
+#   One gpu_job.sh at a time: a second one exits with code 3 without touching the LLM.
 #
-# Run it from the terminal tool with background=true and notify_on_complete=true. The completion
+# Run it from the terminal tool with background=true and notify=true (exactly true, not a list of patterns). The completion
 # notification wakes the agent on the model named in "RESULT model=" (the small one by default,
 # setting after_gpu_job; the big one comes back on demand or when idle). Read the log/RESULT
 # lines, not the exit code alone.
@@ -30,19 +32,32 @@ SMALL="${1:?usage: gpu_job.sh <auto|none|nano|multi|keep|model> -- <command...>}
 HERMES="${HERMES_BIN:-hermes}"
 SMS_CACHE="${HERMES_HOME:-$HOME/.hermes}/cache/smart-model-swap"   # follows the active profile
 LOG="${GPU_JOB_LOG:-$SMS_CACHE/gpu_job_$(date +%Y%m%d_%H%M%S).log}"
-mkdir -p "$(dirname "$LOG")"
+mkdir -p "$(dirname "$LOG")" "$SMS_CACHE"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
+# One job at a time: a second job would swap the LLM under the first one.
+exec 9>"$SMS_CACHE/gpu_job.lock"
+if ! flock -n 9; then
+  log "RESULT free=FAILED — another gpu_job.sh is running (see $SMS_CACHE/gpu_job.active); job NOT run"
+  exit 3
+fi
+# Old job logs: keep two weeks.
+find "$SMS_CACHE" -maxdepth 1 -name 'gpu_job_*.log' -mtime +14 -delete 2>/dev/null
+
 # Marker: while it exists with our PID, SMP's idle watcher will not restore the primary mid-job.
+# Second field: what happens to the LLM (none | keep | the model kept), for the UIs and the veto.
 MARK="$SMS_CACHE/gpu_job.active"
-echo $$ > "$MARK"
+echo "$$ ${SMALL}" > "$MARK"
+
+COMFY_URL="http://127.0.0.1:8188"
+SMI="$(command -v nvidia-smi || echo /usr/lib/wsl/lib/nvidia-smi)"
 
 restored=0
 restore(){
   [ "$restored" = 1 ] && return
   restored=1
-  if curl -sf --max-time 3 http://127.0.0.1:8188/system_stats >/dev/null 2>&1; then
-    log "WARNING: ComfyUI (:8188) is still up and holds VRAM — the job must stop it"
+  if curl -sf --max-time 3 "$COMFY_URL/system_stats" >/dev/null 2>&1; then
+    log "WARNING: ComfyUI ($COMFY_URL) is still up — the job should stop it (an idle one is asked to free its VRAM later)"
   fi
   # Which model delivers the result is the plugin's call (setting after_gpu_job):
   #   small   (default) keep the small model that is loaded, or load the smallest that fits if
@@ -53,11 +68,12 @@ restore(){
   local prefer=()
   [ "$SMALL" != none ] && [ "$SMALL" != keep ] && prefer=(--prefer "$SMALL")
   local out rc model
-  out=$("$HERMES" sms after-job "${prefer[@]}" --timeout 900 2>&1); rc=$?
+  # no --timeout: the CLI waits as long as a swap can legitimately take (settings)
+  out=$("$HERMES" sms after-job ${prefer[@]+"${prefer[@]}"} 2>&1); rc=$?
   echo "$out" >>"$LOG"
   model=$(echo "$out" | sed -n 's/^ *"current": *"\([^"]*\)".*/\1/p' | tail -1)
   if [ $rc -eq 0 ]; then log "RESULT model=${model:-?} (restore=ok)"; else
-    log "RESULT restore=FAILED (rc=$rc) — no model serving; see ~/.hermes/cache/smart-model-swap/runner.log; retry: hermes sms start"
+    log "RESULT restore=FAILED (rc=$rc) — no model serving; see $SMS_CACHE/runner.log; the agent should call sms_restore"
   fi
 }
 trap 'restore; rm -f "$MARK"' EXIT
@@ -70,8 +86,10 @@ case "$SMALL" in
     # named mode: the plugin decides what it means on this machine (auto = the UI setting)
     asked="$SMALL"
     mode_arg=(); [ "$asked" != auto ] && mode_arg=(--mode "$asked")
-    layout=$("$HERMES" sms job-layout --plain "${mode_arg[@]}" ${TASK_GPU:+--task-gpu "$TASK_GPU"} 2>>"$LOG" | tail -1)
-    read -r l_do l_model l_llm l_task l_applied <<<"$layout"
+    layout=$("$HERMES" sms job-layout --plain ${mode_arg[@]+"${mode_arg[@]}"} ${TASK_GPU:+--task-gpu "$TASK_GPU"} 2>>"$LOG" | tail -1)
+    read -r l_do l_model l_llm l_task l_applied l_budget l_cache l_comfy l_smi <<<"$layout"
+    [ -n "${l_comfy:-}" ] && COMFY_URL="$l_comfy"
+    [ -n "${l_smi:-}" ] && [ "$l_smi" != "-" ] && SMI="$l_smi"
     case "$l_do" in
       small) SMALL="$l_model"; [ "${l_llm:--}" != "-" ] && LLM_GPU="$l_llm" ;;
       keep)  SMALL=keep ;;
@@ -83,23 +101,30 @@ case "$SMALL" in
     ;;
 esac
 [ -n "${TASK_GPU:-}" ] && export SMS_TASK_GPU="$TASK_GPU"
+echo "$$ ${SMALL}" > "$MARK"
 case "$SMALL" in
   none) log "FREE: unloading the LLM"
         # graceful: 10 s grace + drain, so the agent's last reply is not cut mid-stream
         "$HERMES" sms stop --graceful >>"$LOG" 2>&1; rc=$? ;;
   keep) log "FREE: nothing to do (the loaded model stays)"; rc=0 ;;
   *)    log "FREE: swapping to '$SMALL'${LLM_GPU:+ on GPU $LLM_GPU}"
-        "$HERMES" sms swap "$SMALL" ${LLM_GPU:+--gpu "$LLM_GPU"} --wait --timeout 900 >>"$LOG" 2>&1; rc=$? ;;
+        # no --timeout: waits as long as this swap can legitimately take (settings)
+        "$HERMES" sms swap "$SMALL" ${LLM_GPU:+--gpu "$LLM_GPU"} --wait >>"$LOG" 2>&1; rc=$? ;;
 esac
 if [ $rc -ne 0 ]; then
   log "RESULT free=FAILED (rc=$rc) — job NOT run"
   exit 1
 fi
 log "FREE ok"
-/usr/lib/wsl/lib/nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader 2>/dev/null | tee -a "$LOG"
+"$SMI" --query-gpu=index,memory.used,memory.free --format=csv,noheader 2>/dev/null | tee -a "$LOG"
 
-log "JOB start"
-"$@" 2>&1 | tee -a "$LOG"
+log "JOB start${JOB_TIMEOUT:+ (timeout $JOB_TIMEOUT)}"
+if [ -n "${JOB_TIMEOUT:-}" ]; then
+  timeout --signal=TERM --kill-after=30 "$JOB_TIMEOUT" "$@" 2>&1 | tee -a "$LOG"
+else
+  "$@" 2>&1 | tee -a "$LOG"
+fi
 job_rc=${PIPESTATUS[0]}
+[ "$job_rc" = 124 ] && [ -n "${JOB_TIMEOUT:-}" ] && log "JOB TIMEOUT after $JOB_TIMEOUT"
 log "RESULT job_rc=$job_rc"
 exit "$job_rc"   # the EXIT trap brings a model back before the notification fires

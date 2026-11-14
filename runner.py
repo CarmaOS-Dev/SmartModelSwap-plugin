@@ -1,13 +1,17 @@
-"""Detached swap runner. Launched by tools.spawn_runner with:
-  runner.py <state_file> <swap|restore|start> <target> <cfg_base64>
+"""Detached swap runner and watcher. Launched by tools.spawn_runner /
+tools.spawn_idle_watch (a transient user service, or a double fork - never a
+child of the caller) with:
+  runner.py <state_file> <swap|restore|start|idle_watch> <target> <cfg_base64>
 
 swap/restore: grace sleep -> drain in-flight requests -> stop the current
-server (signal) -> start target -> verify -> update state. On swap failure it
-restores the primary (brain back > target) and still reports the swap as
-failed.
+server (signal) -> start target -> verify -> update state. On failure another
+model that fits is loaded (auto_recover) and the result stays ok=False.
 start: autostart of the primary (gateway start-up, replaces the old systemd
 unit): wait for the GPU driver and the model file (gpu_wait_s), then load.
+idle_watch: restore the primary when idle, recover a dead server, resume a
+swap whose runner was killed.
 Writes progress to runner.log and state.json; never raises to the parent.
+The state file argument is informational: the state lives under HERMES_HOME.
 """
 from __future__ import annotations
 
@@ -30,14 +34,14 @@ def _watch(name: str, log) -> None:
     try:
         cfg = tools.get_cfg()
         r = tools.spawn_idle_watch(name)
-        if r.get("pid"):
+        if r.get("pid") or r.get("unit"):
             what = []
             if (not tools.same_name(name, cfg.get("primary_model"))
                     and float(cfg.get("idle_restore_min") or 0) > 0):
                 what.append(f"primary comes back after {cfg.get('idle_restore_min')} min idle")
             if cfg.get("auto_recover", True):
                 what.append("swaps to another model if this one dies")
-            log(f"watcher started (pid {r['pid']}): " + "; ".join(what))
+            log(f"watcher started ({r.get('unit') or 'pid %s' % r.get('pid')}): " + "; ".join(what))
     except Exception as e:  # noqa: BLE001
         log(f"watcher not started: {type(e).__name__}: {e}")
 
@@ -103,14 +107,89 @@ def release_or_fallback(entry: dict, prev: str | None, log) -> dict | None:
                      f"{rel['summary']}", "release": rel, "fallback": fallback}
 
 
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _resume_lost(lost: dict, primary: str, lost_since: float, say) -> bool:
+    """A swap/restore/start whose runner died mid-flight (killed together with
+    whatever started it). That is not a model failure: nothing is noted and the
+    same request is relaunched once. Returns True when a new runner was
+    launched (the watcher exits; that runner starts the next watcher)."""
+    st = tools.read_state()
+    action = lost.get("action") or "restore"
+    want = str(lost.get("target") or "") if action == "swap" else primary
+    current = tools.match_model(tools.llm_health(timeout=2.0))
+    if current and tools.same_name(current, want):
+        tools.write_state({"state": "idle", "current": current, "spawned_at": None, "last_result": {
+            "action": action, "target": want, "ok": True, "current": current, "at": _now(),
+            "detail": {"note": "the runner died, but the model came up"}}})
+        say(f"the {action} runner died, but '{current}' came up: state fixed")
+        return False
+    if tools.server_unresponsive():
+        entry = tools.find_model(want) or {}
+        if time.time() - lost_since < float(entry.get("load_timeout_s") or 120) + 60:
+            return False  # its engine is still loading on its own: give it a load's time
+    prev = st.get("resumed") or {}
+    if (tools.same_name(prev.get("target"), want)
+            and time.time() - float(prev.get("at") or 0) < tools.FAILURE_WINDOW_S):
+        say(f"the {action} to '{want}' was cut again (its runner died): not resuming it twice")
+        tools.write_state({"state": "failed", "spawned_at": None, "last_result": {
+            "action": action, "target": want, "ok": False, "at": _now(),
+            "detail": {"error": "the runner died mid-flight twice"}}})
+        return False
+    say(f"the {action} to '{want}' was cut: its runner died mid-flight (killed together with "
+        "the process that started it). Not a model failure: resuming it")
+    tools.write_state({"state": "failed", "spawned_at": None,
+                       "resumed": {"target": want, "at": time.time()}})
+    pin = st.get("pin_gpu")
+    if tools.same_name(want, primary):
+        out = json.loads(tools.h_restore({}))
+    else:
+        out = json.loads(tools.h_swap({"model": want, **({"gpu": pin} if pin is not None else {})}))
+    if out.get("ok") and not out.get("skipped"):
+        say(f"resume: {action} to '{want}' launched")
+        return True
+    say(f"resume refused: {out.get('error') or out.get('skipped')}")
+    return False
+
+
+def _recover(dead: str | None, primary: str, say, note: bool = True) -> int | None:
+    """Load another model after `dead` stopped serving. Returns the exit code
+    when the watcher should exit, else None."""
+    again = bool(dead) and tools.stopped_by_signal(dead) and dead not in tools.recent_failures()
+    if dead:
+        if again:
+            say(f"'{dead}' was stopped by a signal from outside SMP (see llama-{dead}.log): loading it again")
+        else:
+            say(f"'{dead}' died on its own (see llama-{dead}.log): swapping to another model")
+        if note:
+            tools.note_failure(dead, "stopped by a signal" if again else "server died")
+    tools.write_state({"server": None})
+    for name in ([dead] if again else []) + tools.recovery_candidates(dead):
+        if tools.same_name(name, primary):
+            out = json.loads(tools.h_restore({}))
+        else:
+            out = json.loads(tools.h_swap({"model": name}))
+        if out.get("ok"):
+            say(f"auto-recover: loading '{name}' (its runner starts the next watcher)")
+            return 0
+        say(f"auto-recover: '{name}' refused: {out.get('error')}")
+    say("auto-recover: no other model can be loaded; the LLM stays unloaded")
+    return 1
+
+
 def idle_watch(target: str) -> int:
     """Restore the primary after `idle_restore_min` minutes without work on a
-    non-primary model. Never holds the swap lock and never writes the swap
-    state: it only calls h_restore() (preflight + release gate) when idle."""
+    non-primary model; reload a model whose server died (auto_recover); resume
+    a swap whose runner died mid-flight. One watcher at a time (a flock held
+    for its whole life). Never holds the swap lock: it only calls h_restore /
+    h_swap, which run the normal preflight + release gate."""
     cfg = tools.get_cfg()
     minutes = float(cfg.get("idle_restore_min") or 0)
     primary = str(cfg.get("primary_model") or "")
     recover = bool(cfg.get("auto_recover", True))
+    free_comfy = bool(cfg.get("comfy_free_on_idle", True))
     poll = 5.0 if 0 < minutes < 2 else (15.0 if recover else 30.0)
 
     def say(msg: str) -> None:
@@ -118,11 +197,12 @@ def idle_watch(target: str) -> int:
 
     if minutes <= 0 and not recover:
         return 0
-    if tools.idle_watch_status():
+    # The previous watcher may still be exiting (its runner spawned us).
+    lock_fd = tools.watch_lock(timeout_s=20.0)
+    if lock_fd is None:
         return 0
-    tools.idle_watch_file().write_text(json.dumps(
-        {"pid": os.getpid(), "target": target, "minutes": minutes,
-         "started": time.strftime("%Y-%m-%dT%H:%M:%S")}))
+    tools._atomic_json(tools.idle_watch_file(), {"pid": os.getpid(), "target": target,
+                                                 "minutes": minutes, "started": _now()})
     if minutes > 0 and not tools.same_name(target, primary):
         say(f"restore '{primary}' after {minutes:g} min without activity on '{target}'")
     if recover:
@@ -130,17 +210,43 @@ def idle_watch(target: str) -> int:
     try:
         last_counter = tools.llm_activity()
         last_active = time.time()
+        silent = 0
+        lost_since = 0.0
+        comfy_said = False
         while True:
             time.sleep(poll)
             now = time.time()
             if tools.busy_state():
                 last_active = now
+                lost_since = 0.0
                 continue
+            lost = tools.runner_died_midflight()
+            if lost and recover:
+                lost_since = lost_since or now
+                if _resume_lost(lost, primary, lost_since, say):
+                    return 0
+                continue
+            lost_since = 0.0
             health = tools.llm_health(timeout=2.0)
             current = tools.match_model(health)
             if current is None:
-                dead = tools.crashed_model() if recover and not health.get("up") else None
+                if health.get("up"):
+                    say("a model outside the registry is serving; exiting")
+                    return 0
+                dead = tools.crashed_model() if recover else None
                 if not dead:
+                    stuck = tools.server_unresponsive()
+                    if stuck:
+                        # The process is alive but did not answer (a loaded
+                        # host, a long decode): that is not a stop. Keep watching.
+                        silent += 1
+                        if silent == 4:
+                            say(f"'{stuck}' does not answer /health but its process is alive; still watching")
+                        continue
+                    if recover and tools.read_state().get("state") == "failed" and not tools.gpu_job_active():
+                        # a swap/restore ended with nothing serving: bring a model back
+                        say("the last swap/restore left no model serving")
+                        return _recover(None, primary, say) or 0
                     say("no model serving (stopped on purpose); exiting")
                     return 0
                 if tools.gpu_job_active():
@@ -148,20 +254,10 @@ def idle_watch(target: str) -> int:
                 time.sleep(3)  # a swap may have just started: look again
                 if tools.busy_state() or tools.llm_health(timeout=2.0).get("up"):
                     continue
-                say(f"'{dead}' died on its own (see llama-{dead}.log): swapping to another model")
-                tools.note_failure(dead, "server died")
-                tools.write_state({"server": None})
-                for name in tools.recovery_candidates(dead):
-                    if tools.same_name(name, primary):
-                        out = json.loads(tools.h_restore({}))
-                    else:
-                        out = json.loads(tools.h_swap({"model": name}))
-                    if out.get("ok"):
-                        say(f"auto-recover: loading '{name}' (its runner starts the next watcher)")
-                        return 0
-                    say(f"auto-recover: '{name}' refused: {out.get('error')}")
-                say("auto-recover: no other model can be loaded; the LLM stays unloaded")
-                return 1
+                return _recover(dead, primary, say) or 0
+            if silent >= 4:
+                say(f"'{current}' answers again")
+            silent = 0
             if tools.same_name(current, primary) or minutes <= 0:
                 if not recover:
                     say("primary is back; exiting")
@@ -172,17 +268,28 @@ def idle_watch(target: str) -> int:
             working = (counter is not None and last_counter is not None and counter != last_counter)
             working = working or (tools.requests_processing() or 0) > 0
             last_counter = counter if counter is not None else last_counter
-            # Only ComfyUI counts as GPU work here. A resident process that
-            # merely holds some VRAM (an embeddings daemon) must not reset the
-            # idle clock forever: whether the primary fits is the release
-            # gate's call, below.
-            comfy_up = any(h.get("kind") == "comfyui" for h in tools.gpu_holders())
-            if working or tools.gpu_job_active() or comfy_up:
+            # Only a ComfyUI with work queued or running counts as GPU work. An
+            # idle one (even with models cached in VRAM) does not stop the
+            # clock: when the primary does not fit, it is asked to free them.
+            comfy = tools.comfy_status(max_age=10.0)
+            comfy_busy = bool(comfy.get("up") and comfy.get("busy"))
+            if comfy_busy and not comfy_said:
+                say("ComfyUI is working: the idle clock waits for its queue to empty")
+            comfy_said = comfy_busy
+            if working or tools.gpu_job_active() or comfy_busy:
                 last_active = now
                 continue
             if now - last_active < minutes * 60:
                 continue
             rc = tools.check_release(primary)
+            if not rc.get("ok") and comfy.get("up") and free_comfy:
+                say(f"idle {minutes:g} min and ComfyUI is idle: asking it to release its VRAM (/free)")
+                fr = tools.comfy_free()
+                if fr.get("ok"):
+                    time.sleep(5)
+                    rc = tools.check_release(primary)
+                else:
+                    say(f"ComfyUI /free failed: {fr.get('error')}")
             if not rc.get("ok"):
                 say("idle, but the primary does not fit yet: " + str(rc.get("summary")))
                 last_active = now - minutes * 60 + 120  # look again in ~2 min
@@ -200,13 +307,14 @@ def idle_watch(target: str) -> int:
                 tools.idle_watch_file().unlink()
         except (OSError, ValueError):
             pass
+        os.close(lock_fd)
 
 
 def main() -> int:
     if len(sys.argv) < 5:
-        print("usage: runner.py <state_file> <swap|restore> <target> <cfg_b64>")
+        print("usage: runner.py <state_file> <swap|restore|start|idle_watch> <target> <cfg_b64>")
         return 2
-    _state_path, action, target, cfg_b64 = sys.argv[1:5]
+    action, target, cfg_b64 = sys.argv[2:5]
     cfg = json.loads(base64.b64decode(cfg_b64).decode())
     tools.apply_cfg(cfg)
     cfg = tools.get_cfg()
@@ -216,12 +324,15 @@ def main() -> int:
     def log(msg: str) -> None:
         line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
         print(line, flush=True)
-        tail = (tools.read_state().get("log_tail") or []) + [line]
-        tools.write_state({"log_tail": tail[-20:]})
+
+        def add(st: dict) -> None:
+            st["log_tail"] = ((st.get("log_tail") or []) + [line])[-20:]
+        tools.update_state(add)
 
     def finish(ok: bool, detail: dict, current: str | None) -> int:
         tools.write_state({
             "state": "idle" if ok else "failed",
+            "spawned_at": None,
             "current": current,
             "last_result": {
                 "action": action, "target": target, "ok": ok, "current": current,
@@ -252,8 +363,9 @@ def main() -> int:
                     "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "detail": {"error": "swap lock held by another runner"}}})
                 return 1
-            # C3: self-assert our pid so busy_state() tracks the real runner.
-            tools.write_state({"runner_pid": os.getpid()})
+            # C3: self-assert our pid so busy_state() tracks the real runner
+            # (the spawner may not know it: a service or a double fork).
+            tools.write_state({"runner_pid": os.getpid(), "runner_start": tools.proc_start(os.getpid())})
 
             if action == "start":
                 return autostart(log, finish)
@@ -266,10 +378,16 @@ def main() -> int:
             tools.write_state({"state": "swapping" if action == "swap" else "restoring",
                                "action": action, "target": target})
 
-            # 2) drain, then stop the current model the way it is being run
-            drain()
-            prev = tools.match_model(tools.llm_health())
-            servers = tools.detect_servers()
+            # 2) drain, then stop the current model the way it is being run.
+            # Looking up the server takes a moment: a request that starts in
+            # that gap gets its own drain instead of being cut by the stop.
+            for attempt in (1, 2, 3):
+                drain()
+                prev = tools.match_model(tools.llm_health())
+                servers = tools.detect_servers()
+                if attempt == 3 or (tools.requests_processing() or 0) <= 0:
+                    break
+                log("a request started right before the stop: draining again")
             log("stopping current model: "
                 + ("; ".join(tools.describe_server(s) for s in servers) or "nothing running"))
             res = stop()
@@ -364,7 +482,11 @@ def autostart(log, finish) -> int:
     servers = tools.detect_servers()
     if servers:  # something came up while we waited: leave it alone
         log("autostart: server already running: " + "; ".join(tools.describe_server(s) for s in servers))
-        return finish(True, {"note": "already running"}, tools.match_model(tools.llm_health()))
+        current = tools.match_model(tools.llm_health())
+        rc = finish(True, {"note": "already running"}, current)
+        if current:
+            _watch(current, log)
+        return rc
     tools.write_state({"state": "starting", "action": "start", "target": target})
     blocked = release_or_fallback(entry, None, log)
     if blocked:

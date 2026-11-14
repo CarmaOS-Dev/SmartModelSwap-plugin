@@ -1,7 +1,7 @@
 ---
 name: smart-model-routing
 description: "Pick the big or small local model and free VRAM."
-version: 1.0.0
+version: 1.1.0
 author: Oscar Carreto (DraksoN)
 license: MIT
 platforms: [linux]
@@ -27,7 +27,7 @@ This skill decides which one to run and how to switch **without breaking the ses
 - When a swap fails or the LLM stops answering.
 
 ## What a switch costs
-- A swap leaves **every session without an LLM** while it runs (messaging, cron jobs, subagents). How long depends on model size and disk speed: typically 1–4 min.
+- A swap leaves **every session without an LLM** while it runs (messaging, cron jobs, subagents). How long depends on model size, disk speed and whether a reply is still being generated: typically 1–4 min, worst case `sms_status` → `swap_budget_s`.
 - **Never switch for a single message.** Switch only if the new mode will last: 3+ exchanges, 10+ minutes of voice, or a GPU job.
 - **Hysteresis:** after a swap, do not switch back within ~10 min, unless the user asks, a GPU job starts, or the loaded model clearly cannot do the task.
 - **When in doubt, stay** on the model that is already loaded.
@@ -42,7 +42,7 @@ This skill decides which one to run and how to switch **without breaking the ses
 | GPU job over: deliver the result, comment on it, simple follow-ups | **small** (the one left loaded) | change nothing; the big one returns by itself when idle |
 | Voice session over, or heavy work arrives on the small model | big | **Procedure D** |
 | Cron / scheduled task | big, unless the cron *is* the GPU job | a cron **never** leaves the small model loaded |
-| A swap is in progress (`sms_status` → `swap.state` ≠ `idle`) | none | wait (`hermes sms wait`); never start another |
+| A swap is in progress (`sms_status` → `swap.state` ≠ `idle`) | none | end the turn; never start another and never re-run a swap that timed out |
 
 ## Tools
 - `sms_status`: current model, swap state, per-GPU VRAM, ComfyUI, the running `gpu_job`. It is the source of truth.
@@ -50,13 +50,8 @@ This skill decides which one to run and how to switch **without breaking the ses
   - `action`: `stay`, `swap` (to `target`), `unload` (use `gpu_job.sh none`) or `impossible`;
   - `task_gpu`: which GPU to run the task on;
   - `free_after_per_gpu_gib`: the room each option leaves.
-- `sms_swap(model)` and `sms_restore()` launch the switch in the background and **return at once**. The model running you is replaced, so call them as the **LAST tool of the turn**, then reply in one short sentence. The next turn runs on the new model.
-- Blocking CLI, through the terminal tool, to continue **in the same turn** or inside scripts:
-  - `hermes sms swap <model> --wait`
-  - `hermes sms restore --wait`
-  - `hermes sms wait [--target <model>]`
-
-  They print JSON with `ok`, `current` and `waited_s`. The exit code is 0 only if the requested model is serving. In the foreground, use `timeout` ≥ 420 s (max 600).
+- `sms_swap(model)` and `sms_restore()` launch the switch in the background and **return at once**. The model running you is replaced, so call them as the **LAST tool of the turn**, then reply in one short sentence. The next turn runs on the new model. This is the only way to switch from a conversation.
+- **Never run a blocking `hermes sms` command in a foreground terminal**: `swap … --wait`, `restore --wait`, `wait`, `after-job`, `stop --graceful`. A swap can outlast any terminal timeout (worst case: `sms_status` → `swap_budget_s`). The guard blocks them; they are for scripts such as `gpu_job.sh`. If you must follow a swap from the terminal, run it with `background=true` and `notify=true`.
 - `hermes sms check [model] [--wait N]`: the release gate. It reports whether other heavy GPU processes have freed the VRAM the model needs on every GPU.
 - `hermes sms stop [--graceful]` / `hermes sms start`: unload the LLM, or load the primary when nothing is serving (`start` never replaces a model that is serving; use `sms_restore` for that).
 - A swap or restore to the model that is **already loaded** is a free no-op (`"skipped"`). Use `--force` only to reload after editing its flags.
@@ -65,7 +60,8 @@ This skill decides which one to run and how to switch **without breaking the ses
 The big model usually fills most of the VRAM of every GPU it uses. It loads only after other heavy processes (ComfyUI, other models, training) have freed that VRAM.
 1. **Check first:** run `hermes sms check`, which lists who holds the GPU. Do not call `sms_restore` while it fails.
 2. **If it fails:**
-   - if the holder is something **you** started and it has finished (typically ComfyUI after a generation), stop it by exact PID and run `hermes sms check --wait 60`;
+   - an **idle** ComfyUI is not a problem: the idle restore asks it to release its VRAM (`/free`, setting `comfy_free_on_idle`) without stopping it;
+   - if the holder is something **you** started and it has finished (another model, a training run), stop it by exact PID and run `hermes sms check --wait 60`;
    - if it belongs to the **user**, or is still working, leave it alone: stay on the small model and tell the user what holds the GPU.
 3. **The plugin enforces it as well:**
    - the preflight of `sms_restore` / `sms_swap` fails without cutting the current model;
@@ -75,7 +71,7 @@ The big model usually fills most of the VRAM of every GPU it uses. It loads only
 ## Procedure A: GPU-heavy job (free → work → answer on the small model)
 1. **Measure.** Call `sms_plan(needed_free_gb=<the job's VRAM>, task=…)`.
 2. **Choose by `action`:**
-   - `stay`: change nothing and run the task on `task_gpu`;
+   - `stay`: run it through `gpu_job.sh keep -- …` (the loaded model is left alone, the job gets `task_gpu`);
    - `swap`: switch to `target`, usually the small model;
    - `unload`: use `none`, which means no LLM during the job;
    - `impossible`: tell the user it does not fit.
@@ -90,18 +86,21 @@ The big model usually fills most of the VRAM of every GPU it uses. It loads only
    - The job must run on the GPU in `$SMS_TASK_GPU` (ComfyUI: `--cuda-device "${SMS_TASK_GPU:-0}"`). Prefix `TASK_GPU=<n>` to force it.
    - If the job needs more VRAM than one GPU has free (`gpu_job_auto.free_without_llm_gib`), it does not fit in `auto`: use `none` when the job can spread over all GPUs, otherwise tell the user.
    - A model name or `none` instead of `auto` still forces that mode.
-   - Launch it with the terminal tool, `background=true`, `notify_on_complete=true`. The plugin blocks it in the foreground.
+   - Launch it with the terminal tool, `background=true` and `notify=true`. `notify` must be exactly `true`: a list of patterns (`notify=["^SAVED="]`) does **not** tell you when the job ends, and the user never gets the result. The plugin blocks the job in the foreground and without `notify=true`.
+   - Run only the template: append nothing after the job command (no `; sms_restore`; `sms_restore` is a tool, not a shell command, and the template already leaves a model serving).
    - `my_job.sh` must start ComfyUI (on `task_gpu`), submit the workflow, fetch the result, **stop ComfyUI** by exact PID, and print `SAVED=<path>`.
+   - **Never start ComfyUI (or any GPU job) by hand, outside `gpu_job.sh`.** The guard blocks it while a model is loaded. A ComfyUI left open is also seen by the plugin; while its queue works, the primary cannot come back.
    - The template frees VRAM through SMP, runs the job and **always** leaves a model serving before it exits: the **small** one (the one already loaded; with `none`, the smallest that fits). It does not reload the big model, so the result is delivered without a multi-minute wait (setting `after_gpu_job`; `primary` brings back the old behaviour).
 4. **Reply in one sentence and END the turn**, for example "Generating it; freeing the GPU, back in a few minutes". After launching `gpu_job.sh`, make **no further tool or model calls**, not even to poll: the model running you is about to be unloaded. The swap waits 10 s and lets your reply finish first.
-5. **When the completion notification arrives** (you are on the small model), check the log for `RESULT job_rc=0`, `RESULT model=<name> (restore=ok)` and `SAVED=`, then deliver the result **on that model, without switching**. Stay on it for comments and simple requests; load the big model only when the user asks for deep work (Procedure B). `RESULT restore=FAILED` means no model is serving: see **If something fails**.
+5. **When the completion notification arrives** (you are on the small model), check the log for `RESULT job_rc=0`, `RESULT model=<name> (restore=ok)` and `SAVED=`, then deliver the result **on that model, without switching**: send the user the file named in `SAVED=` (the file itself, not only a description of it). Stay on it for comments and simple requests; load the big model only when the user asks for deep work (Procedure B). `RESULT restore=FAILED` means no model is serving: see **If something fails**.
+
+**Any other long job that ends** (a CPU render, ffmpeg, a download) follows the same delivery rule even though it does not use `gpu_job.sh`: launch it with `background=true` and `notify=true`, never with a list of patterns, and send the result when the notification arrives. Without `notify=true` the job ends silently and the user has to ask for it.
 
 ## Procedure B: deep work (load the big model)
 1. If `sms_status` shows the big model, just work.
 2. If the small one is loaded, run `hermes sms check`. If it passes:
-   - say in one line "Loading the big model for this, back in a moment";
-   - run `hermes sms restore --wait` in the foreground (`timeout=600`);
-   - on `ok: true`, continue **in the same turn**.
+   - tell the user in one line: "Loading the big model for this; send me the request again in a couple of minutes" (or "…I'll pick it up on your next message");
+   - call `sms_restore()` as the **last tool** of the turn. The next turn runs on the big model.
 3. If a GPU job still holds the VRAM, **do not** restore. Tell the user the deep work starts when the job ends, or do it on the small model with a caveat, and let them choose.
 
 ## Procedure C: casual / quick voice chat (switch to small)
@@ -116,13 +115,20 @@ The end of a GPU job is **not** a reason to restore: the result is delivered on 
 - a task for the big model arrives (Procedure B);
 - a `[smart-model-swap]` line reminds you the primary is unloaded and there is no reason left for the small one.
 
-To restore: `hermes sms check --wait 120`, then `sms_restore()` as the last tool, or `hermes sms restore --wait` to continue in the same turn.
+To restore: `hermes sms check`, then `sms_restore()` as the last tool of the turn.
 
 ## What the plugin does on its own
 - **Start-up on the primary.** When the gateway starts, the primary is loaded. If a smaller model was left serving (e.g. across a gateway restart), it is swapped for the primary, unless a `gpu_job.sh` or ComfyUI is running. So after a gateway restart, expect the big model; check `sms_status` before assuming the small one is still loaded.
-- **Idle restore.** After any swap to a smaller model, a watcher brings the primary back once the engine has been idle for `idle_restore_min` minutes (default 15) and the release check passes.
+- **Idle restore.** After any swap to a smaller model, a watcher brings the primary back once the engine has been idle for `idle_restore_min` minutes (default 15) and the release check passes. A ComfyUI with work in its queue pauses the clock; an idle one is asked to release its VRAM first.
+- **Interrupted swaps resume.** If a swap's runner dies mid-flight (killed together with whatever started it), the watcher relaunches the same swap once. It is not counted as a model failure.
 - **Auto-recover.** If a model fails to load, or its server dies while serving, the plugin loads another model that fits (the primary first, then from small to big). `sms_status` → `last_result.detail.fallback` and `runner.log` (`auto-recover`) say which one. A model that just failed is not retried automatically for 30 min: do not force it back; report the error from `llama-<model>.log`.
-- **Guard.** `terminal` / `execute_code` calls that stop, kill or launch `llama-server` by hand are blocked. So is a ComfyUI launch while the primary holds the GPU, unless it goes through `gpu_job.sh` or carries `SMS_ALLOW_GPU=1` (only after `sms_plan` said `stay`). The block message says what to use instead.
+- **Guard.** `terminal` / `execute_code` calls are blocked when they:
+  - stop, kill or launch `llama-server` by hand;
+  - launch ComfyUI while any model is loaded or a swap is running, unless through `gpu_job.sh` or with `SMS_ALLOW_GPU=1` (only after `sms_plan` said `stay`);
+  - run a blocking `hermes sms` command in the foreground;
+  - run `gpu_job.sh` in the foreground or without `notify=true`.
+
+  The block message says what to use instead.
 - **Hints.** You get one `[smart-model-swap]` line when:
   - an image or video is requested on the big model;
   - deep work is requested on the small model;
@@ -139,7 +145,9 @@ To restore: `hermes sms check --wait 120`, then `sms_restore()` as the last tool
 
 ## If something fails
 1. Call `sms_status` and read `swap.state`, `last_result.error`, `llm.up` and `server.mode`. A `server.mode` of `external` means someone started the engine outside SMP.
-2. Read the real logs, not the tool's own report: `~/.hermes/cache/smart-model-swap/runner.log` and `llama-<model>.log`.
-3. If no model is serving and no swap is running: `hermes sms start`, then `hermes sms wait`.
-4. If the restore fails on VRAM, run `hermes sms check` to see who holds it, then apply the release check.
-5. After two failures in a row, stop and report `last_result.error` and the last lines of `runner.log` to the user. Do not improvise a manual start.
+2. Read the real logs, not the tool's own report: `$HERMES_HOME/cache/smart-model-swap/runner.log` and `llama-<model>.log`.
+3. A command that timed out did **not** cancel the swap: check `sms_status` and do not launch it again.
+4. If no model is serving and no swap is running: call `sms_restore()` as the last tool (`hermes sms start` only works when the `autostart_primary` setting is on).
+5. `RESULT free=FAILED — job NOT run` in a `gpu_job_*.log`: the swap before the job did not finish. Check `sms_status`, tell the user, and only relaunch the job once `swap.state` is `idle`.
+6. If the restore fails on VRAM, run `hermes sms check` to see who holds it, then apply the release check.
+7. After two failures in a row, stop and report `last_result.error` and the last lines of `runner.log` to the user. Do not improvise a manual start.
