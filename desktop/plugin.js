@@ -90,6 +90,7 @@ const I18N = {
     paramsCount: n => `Parámetros (${n})`,
     importLine: 'importar línea',
     importPlaceholder: 'llama-server -m /ruta/modelo.gguf -c 32768 --temp 0.7 …',
+    modelKeyLabel: 'Clave del modelo (LM Studio)',
     import: 'Importar',
     noOwnParams: 'Sin parámetros propios: solo los args comunes del motor.',
     ctxSharedHint: 'El contexto (-c / --ctx-size) es compartido: al guardar se aplica a todos los modelos del motor (Hermes usa un único contexto).',
@@ -282,6 +283,7 @@ const I18N = {
     paramsCount: n => `Parameters (${n})`,
     importLine: 'import line',
     importPlaceholder: 'llama-server -m /path/model.gguf -c 32768 --temp 0.7 …',
+    modelKeyLabel: 'Model key (LM Studio)',
     import: 'Import',
     noOwnParams: "No model-specific parameters: only the engine's common args.",
     ctxSharedHint: 'The context (-c / --ctx-size) is shared: saving applies it to every model of the engine (Hermes uses a single context).',
@@ -673,16 +675,16 @@ function EngineRow({ e, health, onCall, flash }) {
 // --------------------------------------------------------------------------- model editor (Launcher-style)
 
 const EMPTY_DRAFT = {
-  name: '', original_name: null, engine: 'llamacpp', gguf: '', mmproj: '', bin: '', env: '',
+  name: '', original_name: null, engine: 'llamacpp', gguf: '', model_key: '', mmproj: '', bin: '', env: '',
   role: '', description: '', min_free_vram_gb: '8', load_timeout_s: '240'
 }
 const draftFrom = m => ({
-  name: m.name, original_name: m.name, engine: m.engine || 'llamacpp', gguf: m.gguf || '', mmproj: m.mmproj || '',
+  name: m.name, original_name: m.name, engine: m.engine || 'llamacpp', gguf: m.gguf || '', model_key: m.model_key || '', mmproj: m.mmproj || '',
   bin: m.bin || '', env: envToText(m.env), role: m.role || '', description: m.description || '',
   min_free_vram_gb: String(m.min_free_vram_gb ?? ''), load_timeout_s: String(m.load_timeout_s ?? '')
 })
 const bodyOf = (d, rows) => ({
-  name: d.name.trim(), original_name: d.original_name, engine: d.engine, gguf: d.gguf.trim(), mmproj: d.mmproj.trim(),
+  name: d.name.trim(), original_name: d.original_name, engine: d.engine, gguf: d.gguf.trim(), model_key: (d.model_key || '').trim(), mmproj: d.mmproj.trim(),
   bin: d.bin.trim(), env: d.env, rows: plainRows(rows), role: d.role.trim(), description: d.description.trim(),
   min_free_vram_gb: parseFloat(String(d.min_free_vram_gb).replace(',', '.')) || 0,
   load_timeout_s: parseInt(d.load_timeout_s, 10) || 240
@@ -725,6 +727,14 @@ function ModelEditor({ name, engines, primary, models, rest, onCall, onClose, on
   }
   useEffect(() => load(name), [name])
   const engineId = d ? d.engine : 'llamacpp'
+  const keyed = ((engines || []).find(e => e.id === engineId) || {}).file_based === false
+  const [keys, setKeys] = useState([])
+  useEffect(() => {
+    if (!keyed) return
+    rest(`/engines/models?engine=${encodeURIComponent(engineId)}`)
+      .then(r => setKeys(r && r.ok ? r.models || [] : []))
+      .catch(() => setKeys([]))
+  }, [keyed, engineId])
   useEffect(() => {
     rest(`/params/catalog?engine=${encodeURIComponent(engineId)}${name ? `&model=${encodeURIComponent(name)}` : ''}`)
       .then(c => setCatalog(c && c.ok ? c : null))
@@ -869,8 +879,16 @@ function ModelEditor({ name, engines, primary, models, rest, onCall, onClose, on
         )
       )
     ),
-    h(Field, { label: 'GGUF' }, h('input', { className: cn(FIELD, MONO), value: d.gguf, onChange: set('gguf') })),
-    h(Field, { label: t('mmprojOptional') }, h('input', { className: cn(FIELD, MONO), value: d.mmproj, onChange: set('mmproj') })),
+    keyed
+      ? h(
+          Field,
+          { label: t('modelKeyLabel') },
+          h('input', { className: cn(FIELD, MONO), value: d.model_key || '', onChange: set('model_key'), list: 'sms-model-keys' }),
+          h('datalist', { id: 'sms-model-keys' }, keys.map(k => jsx('option', { value: k.key }, k.key)))
+        )
+      : undefined,
+    keyed ? undefined : h(Field, { label: 'GGUF' }, h('input', { className: cn(FIELD, MONO), value: d.gguf, onChange: set('gguf') })),
+    keyed ? undefined : h(Field, { label: t('mmprojOptional') }, h('input', { className: cn(FIELD, MONO), value: d.mmproj, onChange: set('mmproj') })),
     h(
       'div',
       { className: 'flex gap-1.5' },

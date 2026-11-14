@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0
+
+**LM Studio engine (beta)**
+- **LM Studio is a managed engine.** It also works from WSL with `lms.exe`.
+  - SMP loads and unloads its models with the `lms` CLI (`lms load <key> --identifier <name> …`, `lms unload`)
+    and never spawns or signals a process.
+  - It starts the server with `lms server start` if needed.
+  - Grace, drain, release gate, VRAM profile, fallback and the watcher are the same as for llama.cpp.
+- **Exact keys only.** A model has a `model_key` (the exact key from `lms ls`) instead of a `gguf`, and its
+  `args` are `lms load` options.
+  - `lms load` matches keys loosely and loads another model for an unknown key, so SMP only loads an exact,
+    known key.
+  - The validation (`--estimate-only`, nothing loads) rejects a key that resolves to another model.
+- **Editor:** the GGUF field becomes a model-key field, with a picker of the keys LM Studio knows
+  (`GET /engines/models`).
+- **Identity check:** it only counts loaded models (LM Studio's `/v1/models` lists every downloaded model).
+- **Unloaded behind SMP's back:** a model unloaded from the LM Studio UI or by a TTL is treated as a crash
+  (auto-recover).
+- **Guard:** with LM Studio active, `lms load` and `lms unload` run by hand are blocked.
+- **Engine contract:** engines declare a `lifecycle`: `process` (one process per model, stopped by signal)
+  or `daemon` (a resident server with `load` / `unload` / `loaded`).
+
+**Activity without engine counters**
+- `pre_llm_call` marks every agent LLM call (`cache/…/last_turn`).
+- The idle restore counts these calls as activity on any engine.
+- On an engine without a request counter (LM Studio), the drain waits until the last call is
+  `max(drain_quiet_s, 30 s)` old.
+
+**Consolidation** (one module, no split: tests and the sandbox rely on patching `tools.*`)
+- One fallback loop in the runner (`_load_first`) for a failed load, a release-gate timeout and autostart.
+  - A release-gate fallback now skips models that failed recently.
+- Shared `models_by_size()` / `smallest_model()` (they were computed in four places).
+- Shared `release_margin()`; `vram_budget` reuses `llm_server_pids()`; the hints use `busy_state()`.
+
 ## 0.5.1
 
 **Incident of 2026-11-13: the primary did not come back**

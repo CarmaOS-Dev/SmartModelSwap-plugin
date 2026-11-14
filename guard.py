@@ -92,10 +92,20 @@ def _sms_blocking(prog: str, args: list[str]) -> str | None:
     return None
 
 
+def _lms_manual(prog: str, args: list[str]) -> str | None:
+    """`lms load|unload` by hand (LM Studio's CLI); estimates are read-only."""
+    if prog not in ("lms", "lms.exe") or not args or args[0] not in ("load", "unload"):
+        return None
+    if "--estimate-only" in args:
+        return None
+    return f"`lms {args[0]}` by hand: SmartModelProvider loads and unloads LM Studio models"
+
+
 def _shell_findings(text: str, cwd: str | None = None) -> tuple[list[str], list[str], bool, list[str]]:
     """(llm_violations, scripts_to_scan, launches_comfy, blocking_sms) for one
     shell command text. Follows `cd` so relative script paths resolve (scripts
-    come back absolute when possible)."""
+    come back absolute when possible). LM Studio hand loads come back in
+    blocking_sms prefixed with "lms:" (they only matter when it is the active engine)."""
     bad: list[str] = []
     scripts: list[str] = []
     comfy = False
@@ -118,6 +128,9 @@ def _shell_findings(text: str, cwd: str | None = None) -> tuple[list[str], list[
             blk = _sms_blocking(prog, args)
             if blk:
                 blocking.append(blk)
+            lms = _lms_manual(prog, args)
+            if lms:
+                blocking.append("lms:" + lms)
             if prog == "cd":
                 cwd = resolve(args[0]) if args else os.path.expanduser("~")
                 continue
@@ -268,7 +281,14 @@ def make_hook(tools):
                             "[smart-model-swap guard] Blocked: this would run gpu_job.sh without a "
                             "completion notification, so the result would never be delivered to the user. "
                             f"{how} {after}"}
-            blocking = list(dict.fromkeys(found["sms_blocking"]))
+            lms = [b[4:] for b in found["sms_blocking"] if b.startswith("lms:")]
+            if lms and tools.active_engine_id() == "lmstudio":
+                why = "; ".join(dict.fromkeys(lms))
+                _audit(tools.cache_dir(), f"BLOCK {tool_name}: {why}")
+                return {"action": "block", "message":
+                        f"[smart-model-swap guard] Blocked: {why}. LM Studio is the active engine and "
+                        f"SmartModelProvider owns which model is loaded. {skill_hint(tools)}"}
+            blocking = list(dict.fromkeys(b for b in found["sms_blocking"] if not b.startswith("lms:")))
             if blocking and not found["violations"] and not (
                     tool_name == "terminal" and _truthy((args or {}).get("background")) and notifies(args or {})):
                 _audit(tools.cache_dir(), f"BLOCK {tool_name}: blocking `{'; '.join(blocking)}` in the foreground")

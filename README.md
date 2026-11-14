@@ -95,9 +95,37 @@ CLI (`hermes sms …`):
 | Engine | State | What SMP does |
 |---|---|---|
 | llama.cpp (`llama-server`) | **managed** | Builds the argv, spawns it, health / drain / identity checks, stops it by signal |
+| LM Studio | **managed (beta)** | Loads and unloads models with its `lms` CLI (also `lms.exe` from WSL); never spawns or signals a process |
 | Ollama | 🚧 under construction | Detection only: health + model list on its endpoint |
 | vLLM | 🚧 under construction | Detection only |
-| LM Studio | 🚧 under construction | Detection only |
+
+Engines have one of two lifecycles:
+- **process** (llama.cpp): one server process per model, which SMP spawns in its own scope and stops by signal.
+- **daemon** (LM Studio): a resident server. SMP asks it to load and unload models; the swap logic around it
+  (grace, drain, release gate, VRAM profile, fallback, watcher) is the same.
+
+### LM Studio (beta)
+
+- **Engine:** `engines.lmstudio` → `bin` is the `lms` CLI. Empty means it is found on `PATH`, in
+  `~/.lmstudio/bin`, or in `/mnt/c/Users/*/.lmstudio/bin/lms.exe` on WSL. `port` defaults to 1234. If the server
+  is not running, SMP starts it with `lms server start`.
+- **Models:**
+  - A model sets `"engine": "lmstudio"` and `"model_key"`: the exact key from `lms ls`. There is no `gguf`.
+  - Its `args` are `lms load` options: `-c`, `--gpu max|off|0..1`, `--parallel`, `--ttl`, speculative decoding.
+  - It is served under its registry name (`--identifier`), so the identity check and Hermes see the same id.
+- **Safety:**
+  - `lms load` matches keys loosely and would load *another* model for an unknown key. SMP only loads an exact,
+    known key, and the validation (`lms load … --estimate-only`, nothing loads) rejects a key that resolves to
+    another model.
+  - With LM Studio active, the guard blocks `lms load` / `lms unload` run by hand.
+- **Limits:**
+  - LM Studio exposes no in-flight or token counters. Before a swap, the drain waits until the agent's last LLM
+    call is `max(drain_quiet_s, 30 s)` old (up to `drain_max_s`).
+  - The idle restore counts the agent's LLM calls (`pre_llm_call`) as activity. Requests from other clients
+    (the LM Studio app itself) are not seen.
+  - A model unloaded behind SMP's back (the LM Studio UI, a TTL) is treated like a crash: the watcher loads one
+    again.
+- **One active engine at a time.** A swap only moves between models of the active engine.
 
 Engines are configured in the **Engines** card of both UIs (or in `models.json` →
 `engines`). For llama.cpp, set the binary (a file, or the folder that holds
@@ -165,6 +193,9 @@ presence penalty and repeat penalty.
 
 The active preset overrides the base args on the command line the next time the
 model is loaded.
+
+LM Studio models replace `gguf`/`mmproj` with `"model_key": "<key from lms ls>"`. The editor shows a key field
+with the keys LM Studio knows.
 
 `models.example.json` ships two placeholder entries, `signal` (the big primary, 98 k ctx) and `qwen` (the small
 model, same context). Rename them and point them at your own GGUFs.
@@ -266,7 +297,7 @@ in the dashboard tab / desktop pane, or `hermes sms provider install`.
   (`runner.py idle_watch`, an `sms-runner-idle-*` scope, pid in `cache/smart-model-swap/idle_watch.json`).
   - It restores the primary once the engine has been idle for `idle_restore_min` minutes (default 15; 0 disables).
     Idle means:
-    - no tokens processed (`/metrics` counters);
+    - no tokens processed (`/metrics` counters) and no LLM call from the agent (`pre_llm_call`);
     - no `gpu_job.sh` running (`gpu_job.active` marker);
     - no **work in ComfyUI's queue** (`/queue`). A ComfyUI that is merely open does not stop the clock.
   - It restores only if the release gate passes. If the primary does not fit because an idle ComfyUI still
@@ -423,7 +454,8 @@ What the plugin does on your machine, so you can decide before installing:
   process of the same kind holding the engine port. It never touches unrelated processes; a port held by anything
   else is reported, not killed.
 - **Shell commands.** `nvidia-smi`, `ss`, `systemctl --user show`, `systemd-run`, and `llama-server --help` /
-  `--version` (to build the parameter catalog and validate launch lines).
+  `--version` (to build the parameter catalog and validate launch lines). With LM Studio as the active engine,
+  its `lms` CLI: `load`, `unload`, `server start|status`, and `load --estimate-only` to validate.
 - **Reads outside its folder.**
   - `/proc/<pid>` of other processes, to identify the engine and GPU users.
   - With the guard enabled, the shell scripts a `terminal` command is about to run, to block manual engine management.
@@ -439,7 +471,7 @@ What the plugin does on your machine, so you can decide before installing:
   - Can end a turn at once, with an explanation, while the LLM is unloaded on purpose.
 - **Network.** HTTP only to the endpoints you configure: the engine (default `127.0.0.1:8080`), ComfyUI (default
   `127.0.0.1:8188`: `/system_stats`, `/queue`, and `POST /free` when `comfy_free_on_idle` applies), and the health
-  endpoints of the detection-only engines. No third-party services.
+  endpoints of the other engines (LM Studio: its REST API `/api/v0/models`). No third-party services.
 - **No** telemetry, stored credentials, self-updater or approval bypass.
 
 ## License

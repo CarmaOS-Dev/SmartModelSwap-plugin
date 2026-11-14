@@ -3,7 +3,7 @@
   "label": "Model Swap",
   "description": "Hot-swap local LLM models by VRAM budget: status, swap/restore, engines and model registry.",
   "icon": "Sparkles",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "tab": { "path": "/smart-model-swap", "position": "end" },
   "entry": "dist/index.js",
   "css": "dist/style.css",

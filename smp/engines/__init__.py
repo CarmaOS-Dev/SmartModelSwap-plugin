@@ -5,7 +5,8 @@ from typing import Optional
 
 from .base import Engine, EngineUnavailable, minimal_env
 from .llamacpp import LlamaCppEngine
-from .wip import LmStudioEngine, OllamaEngine, VllmEngine
+from .lmstudio import LmStudioEngine
+from .wip import OllamaEngine, VllmEngine
 
 ENGINES: dict[str, Engine] = {e.id: e for e in (
     LlamaCppEngine(), OllamaEngine(), VllmEngine(), LmStudioEngine())}

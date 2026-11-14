@@ -46,61 +46,56 @@ def _watch(name: str, log) -> None:
         log(f"watcher not started: {type(e).__name__}: {e}")
 
 
-def load_instead(failed: dict, prefer: list, log) -> str | None:
-    """`failed` could not be loaded: bring up another model that fits so the
-    agent keeps a brain. Returns the name now serving, or None."""
-    tools.note_failure(failed["name"], "load failed")
-    if not tools.get_cfg().get("auto_recover", True):
-        return None
-    for name in tools.recovery_candidates(failed["name"], prefer):
+def _load_first(names: list, instead_of: str, log, label: str) -> str | None:
+    """Load the first of `names` that fits right now (release gate on the VRAM
+    free at this moment). A candidate that fails to load is noted and cleared.
+    The one fallback loop for every path: failed load, release timeout,
+    autostart. Returns the name now serving, or None."""
+    for name in names:
         fb = tools.find_model(name)
+        if not fb:
+            continue
         rc = tools.release_check(fb)
         if not rc["ok"]:
             log(f"  '{name}' does not fit now: {rc['summary']}")
             continue
-        log(f"auto-recover: loading '{name}' instead of '{failed['name']}'")
+        log(f"{label}: loading '{name}' instead of '{instead_of}'")
         res = tools.start_model(fb)
         if res.get("ok"):
-            log(f"auto-recover OK: '{name}' up in {res.get('load_s')}s")
+            log(f"{label} OK: '{name}' up in {res.get('load_s')}s")
             return name
-        log(f"auto-recover: '{name}' FAILED too: {res.get('error')}")
+        log(f"{label}: '{name}' FAILED too: {res.get('error')}")
         tools.note_failure(name, "load failed")
         tools.stop_server()
-    log("auto-recover: no other model could be loaded; the LLM stays unloaded")
     return None
+
+
+def load_instead(failed: dict, prefer: list, log) -> str | None:
+    """`failed` could not be loaded: bring up another model that fits so the
+    agent keeps a brain (setting auto_recover). Returns the name now serving."""
+    tools.note_failure(failed["name"], "load failed")
+    if not tools.get_cfg().get("auto_recover", True):
+        return None
+    name = _load_first(tools.recovery_candidates(failed["name"], prefer), failed["name"], log,
+                       "auto-recover")
+    if not name:
+        log("auto-recover: no other model could be loaded; the LLM stays unloaded")
+    return name
 
 
 def release_or_fallback(entry: dict, prev: str | None, log) -> dict | None:
     """Gate before loading `entry`: other heavy GPU processes must have released
-    their VRAM. On timeout the target is NOT loaded; instead the previous model
-    (or the smallest one that fits) is brought up so the agent keeps a brain.
-    Returns None when the gate passed, else the failure detail."""
+    their VRAM. On timeout the target is NOT loaded (and NOT noted as failed:
+    the model is fine, the GPU is busy); instead the previous model, then the
+    primary, then the smallest that fits is brought up so the agent keeps a
+    brain. Returns None when the gate passed, else the failure detail."""
     cfg = tools.get_cfg()
     rel = tools.wait_release(entry, float(cfg.get("release_wait_s") or 0), log)
     if rel["ok"]:
         return None
     log(f"RESOURCES NOT RELEASED for '{entry['name']}': {rel['summary']}")
-    cands = []
-    if prev:
-        cands.append(prev)
-    for m in sorted(tools.load_models().get("models", []),
-                    key=lambda x: float(x.get("min_free_vram_gb", 0))):
-        cands.append(m["name"])
-    fallback = None
-    for name in dict.fromkeys(cands):
-        if name == entry["name"]:
-            continue
-        fb = tools.find_model(name)
-        if not fb or not tools.release_check(fb)["ok"]:
-            continue
-        log(f"loading fallback '{name}' instead (it fits in the VRAM that is free)")
-        res = tools.start_model(fb)
-        if res.get("ok"):
-            log(f"fallback OK: '{name}' up in {res.get('load_s')}s")
-            fallback = name
-            break
-        log(f"fallback '{name}' FAILED: {res.get('error')}")
-        tools.stop_server()
+    fallback = _load_first(tools.recovery_candidates(entry["name"], [prev] if prev else []),
+                           entry["name"], log, "fallback")
     if not fallback:
         log("no fallback model fits: the LLM stays unloaded")
     return {"error": f"other GPU processes still hold the VRAM '{entry['name']}' needs: "
@@ -209,6 +204,7 @@ def idle_watch(target: str) -> int:
         say(f"watching '{target}': if it dies, another model is loaded")
     try:
         last_counter = tools.llm_activity()
+        last_turn = tools.last_turn_at()
         last_active = time.time()
         silent = 0
         lost_since = 0.0
@@ -268,6 +264,9 @@ def idle_watch(target: str) -> int:
             working = (counter is not None and last_counter is not None and counter != last_counter)
             working = working or (tools.requests_processing() or 0) > 0
             last_counter = counter if counter is not None else last_counter
+            turn = tools.last_turn_at()  # the agent called the LLM (any engine)
+            working = working or (turn is not None and last_turn is not None and turn > last_turn)
+            last_turn = turn if turn is not None else last_turn
             # Only a ComfyUI with work queued or running counts as GPU work. An
             # idle one (even with models cached in VRAM) does not stop the
             # clock: when the primary does not fit, it is asked to free them.
@@ -464,10 +463,11 @@ def autostart(log, finish) -> int:
     limit = int(cfg.get("gpu_wait_s") or 0)
     deadline = time.time() + max(0, limit)
     gguf = str(entry.get("gguf") or "")
+    file_based = tools.model_engine(entry)[0].file_based
     waited = False
     while True:
         gpu_ok = bool(tools.get_vram()) or not tools.nvidia_smi_path()
-        file_ok = bool(gguf) and os.path.exists(gguf)
+        file_ok = (bool(gguf) and os.path.exists(gguf)) if file_based else True
         if gpu_ok and file_ok:
             break
         if time.time() >= deadline:

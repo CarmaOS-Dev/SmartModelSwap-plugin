@@ -478,6 +478,17 @@ def find_model(name: str, data: dict | None = None) -> dict | None:
     return None
 
 
+def models_by_size(data: dict | None = None) -> list[dict]:
+    """Registry models from smallest to biggest (declared/measured VRAM need)."""
+    data = load_models() if data is None else data
+    return sorted(data.get("models", []), key=lambda m: float(m.get("min_free_vram_gb") or 0))
+
+
+def smallest_model(data: dict | None = None) -> dict | None:
+    models = models_by_size(data)
+    return models[0] if models else None
+
+
 def available_models() -> list[str]:
     try:
         return [m["name"] for m in load_models().get("models", [])]
@@ -927,6 +938,11 @@ def detect_servers(data: dict | None = None) -> list[dict]:
     (may still be loading, so not listening yet).
     """
     data = load_models() if data is None else data
+    eng, ecfg = engine_for(None, data)
+    if eng.lifecycle == "daemon":  # nothing to signal: what the engine has loaded
+        ids = eng.loaded(ecfg)
+        return [{"mode": "daemon", "engine": eng.id, "label": eng.label, "models": ids,
+                 "pid": None, "via": "api"}] if ids else []
     found: list[dict] = []
 
     def add(info: dict) -> None:
@@ -949,6 +965,8 @@ def describe_server(info: dict | None) -> str:
     if not info or info.get("mode") in (None, "none"):
         return "not running"
     mode = info["mode"]
+    if mode == "daemon":
+        return f"{info.get('label') or info.get('engine')} (loaded: {', '.join(info.get('models') or []) or '-'})"
     if mode == "smp":
         where = f", scope {info['unit']}" if info.get("unit") else ""
         return f"SmartModelProvider (pid {info.get('pid')}{where})"
@@ -1009,6 +1027,16 @@ def stop_server() -> dict:
     instances (embeddings, tests) on other ports are left alone.
     """
     actions: list[str] = []
+    eng, ecfg = engine_for()
+    if eng.lifecycle == "daemon":
+        res = eng.unload(ecfg, None)
+        actions += res.get("actions", [])
+        if not res.get("ok"):
+            return {"ok": False, "actions": actions,
+                    "error": f"{eng.label} still has models loaded: {', '.join(eng.loaded(ecfg))}"}
+        write_state({"server": None})
+        actions.append("VRAM settled" if settle_vram() else "VRAM settle timeout (proceeding)")
+        return {"ok": True, "actions": actions}
     for _attempt in (1, 2):  # second pass covers a wrapper that respawned it
         servers = detect_servers()
         if not servers:
@@ -1147,10 +1175,57 @@ def llm_ready() -> bool:
     return eng.ready(eng.endpoint(ecfg))
 
 
+def turn_marker() -> Path:
+    return cache_dir() / "last_turn"
+
+
+def note_turn() -> None:
+    """pre_llm_call: the agent is about to call the LLM. An engine-independent
+    activity signal (LM Studio exposes no token counters)."""
+    try:
+        turn_marker().touch()
+    except OSError:
+        pass
+
+
+def last_turn_at() -> float | None:
+    try:
+        return turn_marker().stat().st_mtime
+    except OSError:
+        return None
+
+
 def requests_processing() -> int | None:
     """In-flight requests on the active engine, or None if it cannot tell."""
     eng, ecfg = engine_for()
     return eng.in_flight(eng.endpoint(ecfg))
+
+
+TURN_QUIET_MIN_S = 30
+
+
+def _drain_by_turns(cap: float, quiet: float, log) -> None:
+    """Engines without an in-flight counter (LM Studio): wait until the agent
+    has not called the LLM for a while (a reply streams for a while after its
+    call starts), up to the drain cap."""
+    eng, _ecfg = engine_for()
+    if eng.lifecycle != "daemon":
+        return
+    need = max(quiet, TURN_QUIET_MIN_S)
+    t0 = time.time()
+    announced = False
+    while time.time() - t0 < cap:
+        last = last_turn_at()
+        if last is None or time.time() - last >= need:
+            if announced:
+                log(f"drained in {int(time.time() - t0)}s (no LLM call for {int(need)}s)")
+            return
+        if not announced:
+            log(f"{eng.label} has no request counter: waiting until the agent's last LLM call is "
+                f"{int(need)}s old (max {int(cap)}s)")
+            announced = True
+        time.sleep(1)
+    log(f"drain: the agent kept calling the LLM for {int(cap)}s - cutting")
 
 
 def drain_requests(log=print) -> None:
@@ -1167,7 +1242,10 @@ def drain_requests(log=print) -> None:
     # stay idle for drain_quiet_s in a row.
     quiet = max(0.0, float(cfg.get("drain_quiet_s") or 0))
     n = requests_processing()
-    if n is None or stall <= 0 or (n <= 0 and quiet <= 0):
+    if n is None:
+        _drain_by_turns(cap, quiet, log)
+        return
+    if stall <= 0 or (n <= 0 and quiet <= 0):
         return
     announce = f"(cut after {stall}s without progress, max {cap}s)"
     announced = n > 0
@@ -1342,6 +1420,11 @@ def crashed_model() -> str | None:
     """Name of the model whose server died on its own: the state still records
     a running server (a deliberate stop clears it) but its process is gone."""
     srv = read_state().get("server") or {}
+    if srv.get("mode") == "daemon" and srv.get("model"):
+        eng, ecfg = engine_for()
+        if eng.lifecycle == "daemon" and str(srv["model"]) not in eng.loaded(ecfg):
+            return str(srv["model"])  # unloaded behind SMP's back (UI, TTL, crash)
+        return None
     if srv.get("model") and srv.get("pid") and not _pid_alive(srv.get("pid"), srv.get("start")):
         return str(srv["model"])
     return None
@@ -1367,8 +1450,7 @@ def recovery_candidates(failed: str | None, prefer: list | None = None) -> list[
     `prefer` first, then the primary, then the rest from small to big. Skips
     `failed` and everything that failed in the last FAILURE_WINDOW_S."""
     bad = recent_failures() | ({failed} if failed else set())
-    models = sorted(load_models().get("models", []),
-                    key=lambda m: float(m.get("min_free_vram_gb") or 0))
+    models = models_by_size()
     primary = find_model(str(get_cfg().get("primary_model") or ""))
     order = [n for n in (prefer or []) if n]
     order += ([primary["name"]] if primary else []) + [m["name"] for m in models]
@@ -1503,7 +1585,7 @@ def vram_budget(vram: list[dict] | None = None) -> dict:
     vram = get_vram() if vram is None else vram
     total = sum(g["total_mib"] for g in vram) / 1024.0
     free = sum(g["free_mib"] for g in vram) / 1024.0
-    pids = [int(s["pid"]) for s in detect_servers() if s.get("pid") and s.get("mode") != "foreign"]
+    pids = llm_server_pids()
     if not pids:
         return {"gb": round(free, 1), "method": "free now (no managed server loaded)"}
     used = llm_vram_used_mib(pids)
@@ -1528,6 +1610,11 @@ def comfy_busy(max_age: float = 5.0) -> bool:
 # min_free_vram_gb and the engine's split flags (-ts / --device / -sm).
 
 RELEASE_MARGIN_GIB = {"measured": 0.1, "measured-other-ctx": 0.5, "estimated": 0.5, "total": 0.5}
+
+
+def release_margin(source: str | None) -> float:
+    """Headroom (GiB) required on top of a model's need: small when measured."""
+    return RELEASE_MARGIN_GIB.get(str(source or ""), 0.5)
 
 
 def vram_profile_file() -> Path:
@@ -1808,7 +1895,7 @@ def release_check(entry: dict, unloading: dict | None = None,
         credit_total = cn["total_gib"] if not credit else sum(credit.values())
     else:
         credit_total = 0.0
-    margin = RELEASE_MARGIN_GIB.get(need["source"], 0.5)
+    margin = release_margin(need["source"])
     rows, ok = [], True
     if need["per_gpu"]:
         for g in vram:
@@ -1910,6 +1997,8 @@ def start_model(entry: dict) -> dict:
         argv = eng.build_cmd(ecfg, entry, launch_args(entry, data))
     except smp_engines.EngineUnavailable as e:
         return {"ok": False, "started_by": "smp", "error": str(e)}
+    if eng.lifecycle == "daemon":
+        return _start_daemon_model(eng, ecfg, entry, data)
     cmd, scope = _scoped(argv, LLM_SCOPE_PREFIX, name)
     logf = model_log(name)
     rotate_log(logf)
@@ -1934,6 +2023,35 @@ def start_model(entry: dict) -> dict:
         except Exception:  # noqa: BLE001 - measuring must never fail a good load
             pass
     return res
+
+
+def _start_daemon_model(eng, ecfg: dict, entry: dict, data: dict) -> dict:
+    """Load a model on a resident engine (LM Studio): the engine CLI loads it
+    and returns when it serves; then the same identity check and VRAM profile."""
+    name = entry["name"]
+    logf = model_log(name)
+    rotate_log(logf)
+    vram_before = get_vram()
+    t0 = time.time()
+    res = eng.load(ecfg, entry, launch_args(entry, data), float(entry.get("load_timeout_s", 120)))
+    with open(logf, "a") as lf:
+        lf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} load {name} =====\n"
+                 f"{smp_cmdline.join(res.get('cmd') or [])}\n"
+                 + "\n".join(res.get("log_tail") or []) + ("\n" if res.get("log_tail") else "")
+                 + ("OK\n" if res.get("ok") else f"ERROR: {res.get('error')}\n"))
+    if not res.get("ok"):
+        return {"ok": False, "started_by": eng.id, "error": res.get("error"), "log": str(logf),
+                "log_tail": res.get("log_tail") or []}
+    write_state({"server": {"mode": "daemon", "engine": eng.id, "unit": None, "pid": None,
+                            "model": name, "pin_gpu": entry.get("pin_gpu")}})
+    out = {"ok": True, "current": name, "load_s": int(time.time() - t0), "started_by": eng.id}
+    try:
+        prof = record_vram_profile(name, vram_before, get_vram(), pin=entry.get("pin_gpu"))
+        if prof:
+            out["vram_per_gpu_mib"] = prof["per_gpu_mib"]
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def wait_release(entry: dict, timeout_s: float, log=None, poll_s: float = 5.0) -> dict:
@@ -2024,11 +2142,17 @@ def preflight(cfg_entry: dict, need_extra_gb: float = 0.0, swap: bool = True) ->
                        "detail": f"model on '{eng.id}', active engine '{active}'"})
     checks.append({"check": "engine binary", "ok": eng.binary_ok(ecfg, cfg_entry),
                    "detail": eng.binary(ecfg, cfg_entry) or "(not configured)"})
-    gguf = cfg_entry.get("gguf", "")
-    checks.append({"check": "gguf exists", "ok": bool(gguf) and os.path.exists(gguf), "detail": gguf})
-    mm = cfg_entry.get("mmproj")
-    if mm:
-        checks.append({"check": "mmproj exists", "ok": os.path.exists(mm), "detail": mm})
+    if eng.file_based:
+        gguf = cfg_entry.get("gguf", "")
+        checks.append({"check": "gguf exists", "ok": bool(gguf) and os.path.exists(gguf), "detail": gguf})
+        mm = cfg_entry.get("mmproj")
+        if mm:
+            checks.append({"check": "mmproj exists", "ok": os.path.exists(mm), "detail": mm})
+    else:
+        known = eng.known_model(ecfg, cfg_entry)
+        key = str(cfg_entry.get("model_key") or "")
+        checks.append({"check": f"{eng.label} knows the model key", "ok": known is not False and bool(key),
+                       "detail": key or "(model_key is empty)"})
     if eng.managed:
         argv = validate_argv(cfg_entry, data)
         checks.append({"check": "argv accepted by binary", "ok": argv["ok"],
@@ -2265,7 +2389,7 @@ def h_plan(args: dict, **kwargs) -> str:
             if cur_entry is not None and m["name"] == current:
                 free_after, loadable = dict(free_now), True
             else:
-                margin = RELEASE_MARGIN_GIB.get(n["source"], 0.5)
+                margin = release_margin(n["source"])
                 free_after = {g: base[g] - per.get(g, 0.0) for g in gpus}
                 loadable = all(base[g] >= per.get(g, 0.0) + margin for g in gpus)
             r, best = room(free_after)
@@ -2461,8 +2585,7 @@ def job_layout(task_gpu=None, model: str | None = None, mode: str | None = None,
         return done("keep", "keep", f"'{current}' stays loaded; the job runs beside it" if current
                     else "nothing is loaded; the job runs as is", model=current)
 
-    models = sorted(data.get("models", []), key=lambda m: float(m.get("min_free_vram_gb") or 0))
-    small = find_model(str(model), data) if model else (models[0] if models else None)
+    small = find_model(str(model), data) if model else smallest_model(data)
     if not small:
         return done("none", "none", "no model in the registry: the LLM is unloaded during the job")
     name = small["name"]
@@ -2480,7 +2603,7 @@ def job_layout(task_gpu=None, model: str | None = None, mode: str | None = None,
         return done("none", "none", "single GPU: the LLM is unloaded during the job")
     for g in sorted((g for g in gpus if g != task_gpu), key=lambda g: (-base[g], g)):
         need = model_gpu_need(dict(small, pin_gpu=g), gpus, data)
-        margin = RELEASE_MARGIN_GIB.get(need["source"], 0.5)
+        margin = release_margin(need["source"])
         if base[g] >= need["total_gib"] + margin:
             return done("multi", "small", f"'{name}' whole on GPU {g}; GPU {task_gpu} is left to the job",
                         model=name, llm_gpu=g, llm_need_gib=round(need["total_gib"], 1))
@@ -2547,9 +2670,7 @@ def after_job(prefer: str | None = None, timeout_s: float | None = None) -> dict
         return {**out, "ok": True, "current": current, "loaded": None,
                 "note": f"'{current}' is already serving; nothing reloaded"}
 
-    models = sorted(load_models().get("models", []),
-                    key=lambda m: float(m.get("min_free_vram_gb") or 0))
-    names = [m["name"] for m in models]
+    names = [m["name"] for m in models_by_size()]
     pref = find_model(str(prefer)) if prefer else None
     if pref:
         names = [pref["name"]] + [n for n in names if n != pref["name"]]

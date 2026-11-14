@@ -81,10 +81,8 @@ def _since_last_swap(st: dict, now: float) -> float:
 
 
 def _smallest(tools) -> str | None:
-    models = tools.load_models().get("models", [])
-    if not models:
-        return None
-    return min(models, key=lambda m: float(m.get("min_free_vram_gb") or 0)).get("name")
+    m = tools.smallest_model()
+    return m.get("name") if m else None
 
 
 def unloaded_veto(tools, busy_state: dict | None, interrupted: dict | None = None) -> dict | None:
@@ -129,9 +127,10 @@ def unloaded_veto(tools, busy_state: dict | None, interrupted: dict | None = Non
 
 
 def build_context(tools, **kwargs) -> dict | None:
+    tools.note_turn()  # engine-independent activity for the idle restore and the drain
     cfg = tools.get_cfg()
     st = tools.read_state()
-    busy = st.get("state") in tools.BUSY_STATES and tools.runner_alive(st)
+    busy = bool(tools.busy_state())
     if cfg.get("block_when_unloaded", True) or cfg.get("inject_status", True):
         health = tools.llm_health(timeout=1.0)
     else:

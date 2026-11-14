@@ -1,10 +1,10 @@
 name: smart-model-swap
-version: "0.5.1"
+version: "0.6.0"
 manifest_version: 2
 requires_hermes: ">=0.23.0"
 license: MIT
 tags: [models, local-llm, llama.cpp, inference-engines, vram, comfyui, gpu]
-description: "Run a big and a small local LLM on one rig and let the agent switch between them by task: the small one for quick chat and to free VRAM for GPU jobs (ComfyUI), the big one for deep work. SmartModelProvider launches and stops the engine itself (llama.cpp; Ollama, vLLM and LM Studio detection only), swaps in the background without cutting replies, checks per-GPU VRAM before loading, restores the big model when idle, and ships a launch-parameter editor in the dashboard and Desktop."
+description: "Run a big and a small local LLM on one rig and let the agent switch between them by task: the small one for quick chat and to free VRAM for GPU jobs (ComfyUI), the big one for deep work. SmartModelProvider launches and stops the engine itself (llama.cpp; LM Studio in beta through its lms CLI; Ollama and vLLM detection only), swaps in the background without cutting replies, checks per-GPU VRAM before loading, restores the big model when idle, and ships a launch-parameter editor in the dashboard and Desktop."
 author: "Oscar Carreto (DraksoN)"
 kind: standalone
 platforms:

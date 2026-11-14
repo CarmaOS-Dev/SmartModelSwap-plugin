@@ -309,6 +309,11 @@ def _path_exists(p: Any) -> bool:
     return bool(p) and Path(str(p)).expanduser().exists()
 
 
+def _file_based(m: dict) -> bool:
+    eng = engines.get(m.get("engine"))
+    return eng is None or eng.file_based
+
+
 def models_list(reg: dict) -> list:
     out = []
     for m in reg.get("models", []):
@@ -318,6 +323,7 @@ def models_list(reg: dict) -> list:
             "role": m.get("role", ""),
             "description": m.get("description", ""),
             "gguf": m.get("gguf", ""),
+            "model_key": m.get("model_key", ""),
             "mmproj": m.get("mmproj", ""),
             "bin": m.get("bin", ""),
             "env": m.get("env") or {},
@@ -325,7 +331,8 @@ def models_list(reg: dict) -> list:
             "min_free_vram_gb": m.get("min_free_vram_gb"),
             "load_timeout_s": m.get("load_timeout_s"),
             "ctx": tools.model_ctx(m),
-            "exists": _path_exists(m.get("gguf")),
+            "exists": (_path_exists(m.get("gguf")) if _file_based(m)
+                       else bool(m.get("model_key"))),
             "params": tools.model_params(m),          # effective at next load
             "base_params": tools.base_params(m),      # the model's own args
             "active_preset": tools.active_preset(m),
@@ -392,6 +399,7 @@ class ModelDraft(BaseModel):
     original_name: Optional[str] = None   # set when renaming an existing model
     engine: str = "llamacpp"
     gguf: str = ""
+    model_key: str = ""                   # daemon engines (LM Studio): the engine's model key
     mmproj: Optional[str] = ""
     bin: Optional[str] = ""
     env: Optional[Union[str, dict]] = None
@@ -469,14 +477,24 @@ def _draft_entry(body: ModelDraft, reg: dict) -> tuple[Optional[dict], list[str]
         errors.append(t(f"motor desconocido: '{body.engine}'", f"unknown engine: '{body.engine}'"))
     elif not eng.managed:
         errors.append(t(f"{eng.label}: motor en construcción, todavía no admite modelos", f"{eng.label}: engine under construction, models are not supported yet"))
-    gguf = str(Path(body.gguf.strip()).expanduser()) if body.gguf.strip() else ""
-    if not gguf:
-        errors.append(t("falta la ruta del modelo (GGUF)", "the model path (GGUF) is missing"))
-    elif not Path(gguf).exists():
-        errors.append(t(f"el GGUF no existe: {gguf}", f"GGUF not found: {gguf}"))
-    mmproj = str(Path(str(body.mmproj).strip()).expanduser()) if (body.mmproj or "").strip() else ""
-    if mmproj and not Path(mmproj).exists():
-        errors.append(t(f"el mmproj no existe: {mmproj}", f"mmproj not found: {mmproj}"))
+    file_based = eng is None or eng.file_based
+    model_key = body.model_key.strip()
+    gguf = mmproj = ""
+    if file_based:
+        gguf = str(Path(body.gguf.strip()).expanduser()) if body.gguf.strip() else ""
+        if not gguf:
+            errors.append(t("falta la ruta del modelo (GGUF)", "the model path (GGUF) is missing"))
+        elif not Path(gguf).exists():
+            errors.append(t(f"el GGUF no existe: {gguf}", f"GGUF not found: {gguf}"))
+        mmproj = str(Path(str(body.mmproj).strip()).expanduser()) if (body.mmproj or "").strip() else ""
+        if mmproj and not Path(mmproj).exists():
+            errors.append(t(f"el mmproj no existe: {mmproj}", f"mmproj not found: {mmproj}"))
+    elif not model_key:
+        errors.append(t(f"falta la clave del modelo de {eng.label} (ver `lms ls`)",
+                        f"the {eng.label} model key is missing (see `lms ls`)"))
+    elif eng.known_model(eng.normalize((reg.get("engines") or {}).get(eng.id)), {"model_key": model_key}) is False:
+        warnings.append(t(f"{eng.label} no conoce la clave '{model_key}' ahora mismo",
+                          f"{eng.label} does not know the key '{model_key}' right now"))
     binp = (body.bin or "").strip()
     if binp and not Path(binp).expanduser().exists():
         errors.append(t(f"el binario/directorio no existe: {binp}", f"binary/directory not found: {binp}"))
@@ -493,13 +511,17 @@ def _draft_entry(body: ModelDraft, reg: dict) -> tuple[Optional[dict], list[str]
     args, dropped = cmdline.strip_managed(args)
     if dropped:
         warnings.append(t(f"{', '.join(sorted(set(dropped)))}: los pone el motor (GGUF / host / puerto); no se guardan", f"{', '.join(sorted(set(dropped)))}: set by the engine (GGUF / host / port); not saved"))
-    args, mmproj = _sync_mmproj(args, mmproj)
+    if file_based:
+        args, mmproj = _sync_mmproj(args, mmproj)
     if errors:
         return None, errors, warnings
     entry = {"name": name, "engine": eng.id, "role": body.role.strip(),
              "description": body.description.strip(), "gguf": gguf,
              "min_free_vram_gb": float(body.min_free_vram_gb),
              "load_timeout_s": int(body.load_timeout_s), "args": args}
+    if not file_based:
+        entry["model_key"] = model_key
+        entry.pop("gguf", None)
     if mmproj:
         entry["mmproj"] = mmproj
     if binp:
@@ -669,6 +691,23 @@ def get_engines() -> dict:
     reg = load_registry()
     return {"ok": True, "active_engine": tools.active_engine_id(reg),
             "engines": engines_list(reg, with_version=True), "health": health_all(reg, force=True)}
+
+
+@router.get("/engines/models")
+def engine_models(engine: str = "lmstudio") -> dict:
+    """Model keys a daemon engine knows (LM Studio: downloaded models), for the
+    editor's model-key picker."""
+    eng = engines.get(engine)
+    if eng is None or eng.file_based:
+        return {"ok": False, "error": t("no es un motor con claves de modelo", "not a model-key engine")}
+    reg = load_registry()
+    ecfg = eng.normalize((reg.get("engines") or {}).get(eng.id))
+    models = eng._api_models(ecfg) if hasattr(eng, "_api_models") else None
+    if models is None:
+        return {"ok": False, "error": t(f"{eng.label} no responde", f"{eng.label} does not answer")}
+    return {"ok": True, "models": [{"key": m.get("id"), "type": m.get("type"), "state": m.get("state"),
+                                    "max_ctx": m.get("max_context_length")}
+                                   for m in models if m.get("type") in ("llm", "vlm")]}
 
 
 @router.post("/engines/update")

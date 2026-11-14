@@ -74,6 +74,8 @@
       minVramLabel: "VRAM mínima (GB)",
       loadTimeoutLabel: "Timeout de carga (s)",
       ggufLabel: "Modelo (GGUF)",
+      modelKeyLabel: "Clave del modelo (LM Studio)",
+      modelKeyPlaceholder: "clave de `lms ls`, p. ej. qwen3.5-9b-…",
       ggufPlaceholder: "/ruta/al/modelo.gguf",
       mmprojLabel: "mmproj (visión, opcional)",
       mmprojPlaceholder: "/ruta/al/mmproj.gguf",
@@ -293,6 +295,8 @@
       minVramLabel: "Min. VRAM (GB)",
       loadTimeoutLabel: "Load timeout (s)",
       ggufLabel: "Model (GGUF)",
+      modelKeyLabel: "Model key (LM Studio)",
+      modelKeyPlaceholder: "key from `lms ls`, e.g. qwen3.5-9b-…",
       ggufPlaceholder: "/path/to/model.gguf",
       mmprojLabel: "mmproj (vision, optional)",
       mmprojPlaceholder: "/path/to/mmproj.gguf",
@@ -605,12 +609,13 @@
   }
 
   // ------------------------------------------------------------- model editor
-  const EMPTY = { name: "", original_name: null, engine: "llamacpp", gguf: "", mmproj: "", bin: "", env: "",
+  const EMPTY = { name: "", original_name: null, engine: "llamacpp", gguf: "", model_key: "", mmproj: "", bin: "", env: "",
     role: "", description: "", min_free_vram_gb: "8", load_timeout_s: "240" };
 
   function draftFrom(m) {
     return {
-      name: m.name, original_name: m.name, engine: m.engine || "llamacpp", gguf: m.gguf || "", mmproj: m.mmproj || "",
+      name: m.name, original_name: m.name, engine: m.engine || "llamacpp", gguf: m.gguf || "",
+      model_key: m.model_key || "", mmproj: m.mmproj || "",
       bin: m.bin || "", env: envToText(m.env), role: m.role || "", description: m.description || "",
       min_free_vram_gb: String(m.min_free_vram_gb == null ? "" : m.min_free_vram_gb),
       load_timeout_s: String(m.load_timeout_s == null ? "" : m.load_timeout_s)
@@ -618,7 +623,8 @@
   }
   function bodyOf(d, rows) {
     return {
-      name: d.name.trim(), original_name: d.original_name, engine: d.engine, gguf: d.gguf.trim(), mmproj: d.mmproj.trim(),
+      name: d.name.trim(), original_name: d.original_name, engine: d.engine, gguf: d.gguf.trim(),
+      model_key: (d.model_key || "").trim(), mmproj: d.mmproj.trim(),
       bin: d.bin.trim(), env: d.env, rows: plainRows(rows), role: d.role.trim(), description: d.description.trim(),
       min_free_vram_gb: parseFloat(String(d.min_free_vram_gb).replace(",", ".")) || 0,
       load_timeout_s: parseInt(d.load_timeout_s, 10) || 240
@@ -686,6 +692,15 @@
     const [manual, setManual] = useState({ key: "", value: "" });
     const [importText, setImportText] = useState("");
     const [showImport, setShowImport] = useState(false);
+    const [keys, setKeys] = useState([]);
+    const engInfo = d ? (props.engines || []).find(function (e) { return e.id === d.engine; }) || {} : {};
+    const keyed = engInfo.file_based === false;
+    useEffect(function () {
+      if (!keyed) return;
+      get("/engines/models?engine=" + encodeURIComponent(d.engine)).then(function (r) {
+        setKeys(r && r.ok ? r.models || [] : []);
+      }).catch(function () { setKeys([]); });
+    }, [keyed, d && d.engine]);
 
     function loadModel(name) {
       setMsg(null); setPreview(null);
@@ -819,9 +834,15 @@
           h("input", { className: "sms-input", value: d.min_free_vram_gb, onChange: set("min_free_vram_gb"), inputMode: "decimal" })),
         h("label", { className: "sms-field" }, h("span", { className: "sms-cap" }, t("loadTimeoutLabel")),
           h("input", { className: "sms-input", value: d.load_timeout_s, onChange: set("load_timeout_s"), inputMode: "numeric" }))),
-      h("label", { className: "sms-field" }, h("span", { className: "sms-cap" }, t("ggufLabel")),
+      keyed ? h("label", { className: "sms-field" }, h("span", { className: "sms-cap" }, t("modelKeyLabel")),
+        h("input", { className: "sms-input mono", value: d.model_key || "", onChange: set("model_key"),
+          placeholder: t("modelKeyPlaceholder"), list: "sms-model-keys" }),
+        h("datalist", { id: "sms-model-keys" }, keys.map(function (k) {
+          return h("option", { key: k.key, value: k.key }, (k.state === "loaded" ? "● " : "") + (k.max_ctx ? k.max_ctx + " ctx" : ""));
+        }))) : null,
+      keyed ? null : h("label", { className: "sms-field" }, h("span", { className: "sms-cap" }, t("ggufLabel")),
         h("input", { className: "sms-input mono", value: d.gguf, onChange: set("gguf"), placeholder: t("ggufPlaceholder") })),
-      h("label", { className: "sms-field" }, h("span", { className: "sms-cap" }, t("mmprojLabel")),
+      keyed ? null : h("label", { className: "sms-field" }, h("span", { className: "sms-cap" }, t("mmprojLabel")),
         h("input", { className: "sms-input mono", value: d.mmproj, onChange: set("mmproj"), placeholder: t("mmprojPlaceholder") })),
       h("div", { className: "sms-form" },
         h("label", { className: "sms-field" }, h("span", { className: "sms-cap" }, t("modelBinaryLabel")),

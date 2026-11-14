@@ -9,7 +9,7 @@ Planned management (not implemented):
                per-model options (num_ctx, num_gpu, sampling).
   * vLLM     - ``vllm serve <model> --port P <args>``, one model per process
                (same lifecycle as llama.cpp).
-  * LM Studio - ``lms server start`` + ``lms load/unload`` (context length, GPU offload).
+LM Studio is managed (beta) in lmstudio.py.
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ class _Wip(Engine):
 
 
 class OllamaEngine(_Wip):
+    lifecycle = "daemon"  # when implemented: a resident server, like LM Studio
     id = "ollama"
     label = "Ollama"
     default_port = 11434
@@ -36,9 +37,3 @@ class VllmEngine(_Wip):
     default_port = 8000
     exe_names = ("vllm",)
 
-
-class LmStudioEngine(_Wip):
-    id = "lmstudio"
-    label = "LM Studio"
-    default_port = 1234
-    exe_names = ("lms",)

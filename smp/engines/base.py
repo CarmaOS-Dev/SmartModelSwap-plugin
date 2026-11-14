@@ -8,6 +8,13 @@ engine only contributes argv, env and probes.
 
 Engine config (``models.json`` -> ``engines.<id>``):
     {"bin": str, "host": str, "port": int, "env": {K: V}, "common_args": [str]}
+
+Two lifecycles:
+  process  one server process per model (llama.cpp, vLLM): SMP spawns it in
+           its own scope and stops it by signal (tools.start_model/stop_server).
+  daemon   a resident server that loads and unloads models on request (LM
+           Studio, Ollama): the engine implements load()/unload()/loaded();
+           SMP never signals it.
 """
 from __future__ import annotations
 
@@ -28,7 +35,9 @@ from ..i18n import t
 # the model itself (models.json), which is applied on top.
 _ENV_KEEP = ("PATH", "HOME", "LANG", "LANGUAGE", "LD_LIBRARY_PATH", "TMPDIR", "USER", "LOGNAME",
              # the launch is wrapped in `systemd-run --user --scope`, which needs the user bus
-             "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+             "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+             # WSL interop: a Windows engine CLI (lms.exe) needs these to start at all
+             "WSL_INTEROP", "WSLENV", "WSL_DISTRO_NAME")
 _ENV_KEEP_PREFIXES = ("LC_", "CUDA_", "GGML_")
 
 
@@ -63,8 +72,10 @@ def proc_argv(pid: int) -> list[str]:
 class Engine:
     id = ""
     label = ""
-    status = "stable"        # "stable" | "wip" (shown as "under construction")
+    status = "stable"        # "stable" | "beta" | "wip" (shown as "under construction")
     managed = True           # SMP can start/stop/swap models on it
+    lifecycle = "process"    # "process" | "daemon" (see the module docstring)
+    file_based = True        # models are files on disk (gguf/mmproj); False: a key the engine resolves
     default_port = 8080
     exe_names: tuple[str, ...] = ()
     note = ""
@@ -160,6 +171,28 @@ class Engine:
         flags that spread it over several. The device itself is picked in env()."""
         return list(args)
 
+    # ------------------------------------------------------------ daemon lifecycle
+    def load(self, ecfg: dict, entry: dict, args: list[str], timeout: float) -> dict:
+        """daemon engines: load `entry` and wait until it serves. {ok, error?}"""
+        raise EngineUnavailable(t(f"{self.label}: motor en construcción",
+                                  f"{self.label}: engine under construction"))
+
+    def unload(self, ecfg: dict, entry: Optional[dict] = None) -> dict:
+        """daemon engines: unload `entry` (None: every model SMP may have loaded)."""
+        return {"ok": True, "actions": []}
+
+    def loaded(self, ecfg: dict) -> list[str]:
+        """daemon engines: ids of the models loaded right now."""
+        return []
+
+    def known_model(self, ecfg: dict, entry: dict) -> Optional[bool]:
+        """daemon engines: does the engine know this model key? None = unknown."""
+        return None
+
+    def rows(self, args: list, info) -> list[dict]:
+        from ..cmdline import args_to_rows
+        return args_to_rows(args, info.takes_value if info is not None else None)
+
     # ------------------------------------------------------------ probes
     def probe(self, url: str, timeout: float = 1.5) -> dict:
         """OpenAI-compatible /v1/models (llama.cpp, vLLM, Ollama, LM Studio)."""
@@ -196,6 +229,7 @@ class Engine:
     def describe(self, ecfg: dict) -> dict:
         e = self.normalize(ecfg)
         return {"id": self.id, "label": self.label, "status": self.status, "managed": self.managed,
+                "lifecycle": self.lifecycle, "file_based": self.file_based,
                 "note": self.note_text(), "url": self.endpoint(e), **e}
 
     def note_text(self) -> str:

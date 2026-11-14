@@ -1,4 +1,4 @@
-# Smart-Model-Swap: installation guide (v0.5.1)
+# Smart-Model-Swap: installation guide (v0.6.0)
 
 ## Requirements
 - Hermes Agent **0.23.0** or newer.
